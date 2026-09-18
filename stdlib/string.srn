@@ -1,32 +1,21 @@
 // Serenity standard-library module: string
 //
-// String utilities built on the core string builtins (length, charAt,
-// substring, toUpper, toLower, trim, contains, indexOf, toInt). Serenity has
-// no mutable variables, so every builder here is written recursively; very
-// long inputs will hit the host recursion limit. ltrim/rtrim only strip
-// literal space characters (use the trim builtin for general whitespace).
+// String utilities built on the core string builtins (charAt, substring,
+// toUpper, toLower, trim, toInt) and the polymorphic collection builtins
+// (length, contains, indexOf, reverse, toString). Serenity has no mutable
+// variables, so every builder here is written recursively; very long inputs
+// will hit the host recursion limit. ltrim/rtrim only strip literal space
+// characters (use the trim builtin for general whitespace).
 //
 // Expected usage: a program at the project root imports this with
 //     %import <stdlib/string>
 //
-// Exported names: isEmpty, reverse, startsWith, endsWith, repeat, capitalize,
+// Exported names: isEmpty, startsWith, endsWith, repeat, capitalize,
 //   titleCase, replace, countOccurrences, ltrim, rtrim, padLeft, padRight,
 //   truncate, wordCount
 
 func isEmpty(s) => (
     return length(s) == 0;
-)
-
-func reverse(s) => (
-    return reverseRest(s, length(s) - 1);
-)
-
-func reverseRest(s, i) => (
-    if (i < 0) => {
-        return "";
-    } else => {
-        return charAt(s, i) + reverseRest(s, i - 1);
-    }
 )
 
 func startsWith(s, prefix) => (

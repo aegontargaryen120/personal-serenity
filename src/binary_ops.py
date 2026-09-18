@@ -20,6 +20,8 @@ def _type_name(value):
         return 'string'
     if isinstance(value, int):
         return 'integer'
+    if isinstance(value, tuple):
+        return 'list'
     return type(value).__name__
 
 
@@ -39,6 +41,8 @@ def _relational(op, left, right):
     if isinstance(left, str) != isinstance(right, str):
         raise OperationError(
             f"cannot compare {_type_name(left)} with {_type_name(right)} using '{op}'")
+    if isinstance(left, tuple) or isinstance(right, tuple):
+        raise OperationError(f"cannot compare lists using '{op}'")
     try:
         return left < right if op == '<' else \
             left <= right if op == '<=' else \
@@ -64,8 +68,14 @@ def apply(op, left, right):
             if left is None or right is None:
                 raise OperationError('cannot concatenate a string with null')
             raise OperationError('cannot concatenate a string with a non-string')
+        if isinstance(left, tuple) or isinstance(right, tuple):
+            if not (isinstance(left, tuple) and isinstance(right, tuple)):
+                raise OperationError('cannot concatenate a list with a non-list')
+            return left + right
         return _numeric('+', left, right)
     if op in ('-', '*', '/', '%', '^'):
+        if isinstance(left, tuple) or isinstance(right, tuple):
+            raise OperationError(f"cannot use '{op}' on lists")
         return _numeric(op, left, right)
     if op == '==':
         return left == right

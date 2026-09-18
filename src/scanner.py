@@ -34,6 +34,8 @@ class TokenType(Enum):
     OR_OR = auto()
     LBRACE = auto()
     RBRACE = auto()
+    LBRACKET = auto()
+    RBRACKET = auto()
     QUESTION = auto()
     COLON = auto()
     EQUAL = auto()
@@ -68,6 +70,7 @@ class Scanner:
         ';': TokenType.SEMICOLON, '+': TokenType.PLUS, '-': TokenType.MINUS,
         '*': TokenType.STAR, '/': TokenType.SLASH, '%': TokenType.PERCENT,
         '^': TokenType.CARET, '{': TokenType.LBRACE, '}': TokenType.RBRACE,
+        '[': TokenType.LBRACKET, ']': TokenType.RBRACKET,
         '?': TokenType.QUESTION, ':': TokenType.COLON, '=': TokenType.EQUAL,
     }
 

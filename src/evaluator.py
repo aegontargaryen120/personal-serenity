@@ -1,6 +1,10 @@
 from .binary_ops import apply as apply_operator, OperationError
 from .string_builtins import (
-    length, char_at, substring, to_upper, to_lower, trim, contains, index_of, to_int,
+    char_at, substring, to_upper, to_lower, trim, to_int,
+)
+from .list_builtins import (
+    length, contains, index_of, at, append, prepend, head, tail, reverse,
+    concat, join, to_string,
 )
 
 
@@ -19,15 +23,27 @@ class _ReturnSignal(Exception):
 MAX_LOOP_ITERATIONS = 1000000
 
 STRING_FUNCTIONS = {
-    'length': (lambda value: length(value), 1),
     'charAt': (lambda value, index: char_at(value, index), 2),
     'substring': (lambda value, start, end: substring(value, start, end), 3),
     'toUpper': (lambda value: to_upper(value), 1),
     'toLower': (lambda value: to_lower(value), 1),
     'trim': (lambda value: trim(value), 1),
+    'toInt': (lambda value: to_int(value), 1),
+}
+
+LIST_FUNCTIONS = {
+    'length': (lambda value: length(value), 1),
     'contains': (lambda haystack, needle: contains(haystack, needle), 2),
     'indexOf': (lambda haystack, needle: index_of(haystack, needle), 2),
-    'toInt': (lambda value: to_int(value), 1),
+    'at': (lambda value, index: at(value, index), 2),
+    'append': (lambda value, item: append(value, item), 2),
+    'prepend': (lambda value, item: prepend(value, item), 2),
+    'head': (lambda value: head(value), 1),
+    'tail': (lambda value: tail(value), 1),
+    'reverse': (lambda value: reverse(value), 1),
+    'concat': (lambda left, right: concat(left, right), 2),
+    'join': (lambda values, separator: join(values, separator), 2),
+    'toString': (lambda value: to_string(value), 1),
 }
 
 
@@ -59,7 +75,18 @@ class Evaluator:
             self._require_arity(name, arguments, 1)
             code = self._evaluate(arguments[0], caller_environment)
             raise SystemExit(code)
+        function = self.functions.get(name)
+        if function is not None:
+            if len(function.params) != len(arguments):
+                raise RuntimeError(f"{name} expects {len(function.params)} arguments, got {len(arguments)}")
+            environment = dict(zip(function.params, (self._evaluate(arg, caller_environment) for arg in arguments)))
+            try:
+                return self._execute_statements(function.body, environment)
+            except _ReturnSignal as signal:
+                return signal.value
         builtin = STRING_FUNCTIONS.get(name)
+        if builtin is None:
+            builtin = LIST_FUNCTIONS.get(name)
         if builtin is not None:
             function, arity = builtin
             self._require_arity(name, arguments, arity)
@@ -67,16 +94,7 @@ class Evaluator:
                 return function(*(self._evaluate(argument, caller_environment) for argument in arguments))
             except OperationError as error:
                 raise RuntimeError(str(error)) from None
-        function = self.functions.get(name)
-        if function is None:
-            raise RuntimeError(f"undefined function '{name}'")
-        if len(function.params) != len(arguments):
-            raise RuntimeError(f"{name} expects {len(function.params)} arguments, got {len(arguments)}")
-        environment = dict(zip(function.params, (self._evaluate(arg, caller_environment) for arg in arguments)))
-        try:
-            return self._execute_statements(function.body, environment)
-        except _ReturnSignal as signal:
-            return signal.value
+        raise RuntimeError(f"undefined function '{name}'")
 
     def _execute_statements(self, statements, environment):
         from .ast_nodes import LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt
@@ -144,7 +162,7 @@ class Evaluator:
 
     @staticmethod
     def _truthy(value):
-        return value is not False and value is not None and value != '' and value != 0
+        return value is not False and value is not None and value != '' and value != 0 and value != ()
 
     @staticmethod
     def _display(value):
@@ -154,15 +172,19 @@ class Evaluator:
             return 'false'
         if value is None:
             return 'null'
+        if isinstance(value, tuple):
+            return to_string(value)
         return value
 
     def _evaluate(self, expression, environment=None):
         environment = {} if environment is None else environment
-        from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call
+        from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, ListLiteral
         if isinstance(expression, IntLiteral) or isinstance(expression, StringLiteral) or isinstance(expression, BoolLiteral):
             return expression.value
         if isinstance(expression, NullLiteral):
             return None
+        if isinstance(expression, ListLiteral):
+            return tuple(self._evaluate(element, environment) for element in expression.elements)
         if isinstance(expression, Identifier):
             if expression.name not in environment:
                 raise RuntimeError(f"undefined variable '{expression.name}'")

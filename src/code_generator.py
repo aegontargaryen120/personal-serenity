@@ -10,10 +10,14 @@ genuinely computed at runtime: string concatenation and the string library are
 emitted as calls to `_serenity_*` subroutines that malloc and build actual byte
 buffers when the program runs.
 """
-from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, ExprStmt, Function
+from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, ExprStmt, Function, ListLiteral
 from .binary_ops import apply as apply_operator, OperationError
 from .string_builtins import (
-    length, char_at, substring, to_upper, to_lower, trim, contains, index_of, to_int,
+    char_at, substring, to_upper, to_lower, trim, to_int,
+)
+from .list_builtins import (
+    length, contains, index_of, at, append, prepend, head, tail, reverse,
+    concat, join, to_string,
 )
 
 
@@ -29,6 +33,8 @@ STRING_PRODUCING_FUNCTIONS = {
     'toUpper': (to_upper, 1),
     'toLower': (to_lower, 1),
     'trim': (trim, 1),
+    'join': (join, 2),
+    'toString': (to_string, 1),
 }
 
 NUMERIC_FUNCTIONS = {
@@ -38,7 +44,26 @@ NUMERIC_FUNCTIONS = {
     'toInt': (to_int, 1),
 }
 
-ALL_BUILTIN_FUNCTIONS = {**STRING_PRODUCING_FUNCTIONS, **NUMERIC_FUNCTIONS}
+LIST_FUNCTIONS = {
+    'at': (at, 2),
+    'append': (append, 2),
+    'prepend': (prepend, 2),
+    'head': (head, 1),
+    'tail': (tail, 1),
+    'reverse': (reverse, 1),
+    'concat': (concat, 2),
+}
+
+# Builtins whose first argument is a string value (as opposed to a list or any
+# value). `_expr_uses_as_string` uses this so that a name appearing in the
+# subject position of `prepend`, `at`, `append`, `toString`, or `join` is not
+# wrongly forced to be a string parameter.
+STRING_SUBJECT_BUILTINS = {
+    'length', 'contains', 'indexOf', 'toInt',
+    'charAt', 'substring', 'toUpper', 'toLower', 'trim',
+}
+
+ALL_BUILTIN_FUNCTIONS = {**STRING_PRODUCING_FUNCTIONS, **NUMERIC_FUNCTIONS, **LIST_FUNCTIONS}
 
 
 class CodeGen:
@@ -654,6 +679,8 @@ class CodeGen:
             return [f'    mov x0, #{1 if expression.value else 0}']
         if isinstance(expression, NullLiteral):
             return ['    mov x0, #0']
+        if isinstance(expression, ListLiteral):
+            raise CompileError('lists are only supported at compile time')
         if isinstance(expression, StringLiteral):
             label, size = self._new_string(expression.value)
             return [f'    adrp x0, {label}@PAGE', f'    add x0, x0, {label}@PAGEOFF', f'    mov x1, #{size}']
@@ -707,6 +734,8 @@ class CodeGen:
             return 'string'
         if isinstance(expression, NullLiteral):
             return 'null'
+        if isinstance(expression, ListLiteral):
+            return 'list'
         if isinstance(expression, Identifier):
             if expression.name in env:
                 kind = env[expression.name]
@@ -728,9 +757,12 @@ class CodeGen:
             if expression.operator in ('==', '!=', '<', '<=', '>', '>=', '&&', '||'):
                 return 'bool'
             if expression.operator == '+':
-                if (self._static_kind(expression.left, env, seen) == 'string'
-                        or self._static_kind(expression.right, env, seen) == 'string'):
+                left_kind = self._static_kind(expression.left, env, seen)
+                right_kind = self._static_kind(expression.right, env, seen)
+                if left_kind == 'string' or right_kind == 'string':
                     return 'string'
+                if left_kind == 'list' or right_kind == 'list':
+                    return 'list'
                 return 'int'
             return 'int'
         if isinstance(expression, Conditional):
@@ -742,6 +774,10 @@ class CodeGen:
                 return 'string'
             if expression.callee in NUMERIC_FUNCTIONS:
                 return 'int'
+            if expression.callee in LIST_FUNCTIONS:
+                if expression.callee in ('append', 'prepend', 'reverse', 'concat'):
+                    return 'list'
+                return 'unknown'
             if expression.callee == 'eval':
                 return self._static_kind(expression.arguments[0], env, seen) if expression.arguments else 'unknown'
             if expression.callee in self.user_functions:
@@ -760,7 +796,7 @@ class CodeGen:
     @staticmethod
     def _kind_name(kind):
         return {'int': 'integer', 'bool': 'bool', 'string': 'string',
-                'null': 'null', 'unknown': 'value'}.get(kind, 'value')
+                'null': 'null', 'list': 'list', 'unknown': 'value'}.get(kind, 'value')
 
     def _compile_runtime_binary(self, expression, env=None):
         operator = expression.operator
@@ -924,6 +960,38 @@ class CodeGen:
             if len(arguments) != 1:
                 raise CompileError('exit expects 0 or 1 argument')
             return [*self._compile_runtime_expression(arguments[0], env), '    bl _exit']
+        if callee in self.user_functions:
+            function = self.user_functions[callee]
+            if len(arguments) != len(function.params):
+                raise CompileError(f'{callee} expects {len(function.params)} arguments, got {len(arguments)}')
+            param_kinds = self._function_param_kinds(function)
+            starts = []
+            total = 0
+            for argument, kind in zip(arguments, param_kinds):
+                arg_kind = self._static_kind(argument, env)
+                if arg_kind == 'list':
+                    raise CompileError(f"cannot pass a list to compiled function '{callee}'")
+                if kind == 'string':
+                    if arg_kind != 'string' and arg_kind != 'unknown':
+                        raise CompileError(f"'{callee}' expects a string, got {self._kind_name(arg_kind)}")
+                elif arg_kind == 'string':
+                    raise CompileError(f"cannot pass a string to non-string parameter of '{callee}'")
+                starts.append(total)
+                total += self._width(kind)
+            if total > 8:
+                raise CompileError(f'too many arguments ({len(arguments)}), maximum is 8')
+            lines = []
+            for argument, kind in reversed(list(zip(arguments, param_kinds))):
+                lines.extend(self._compile_runtime_expression(argument, env))
+                if kind == 'string':
+                    lines.append('    str x1, [sp, #-16]!')
+                    lines.append('    str x0, [sp, #-16]!')
+                else:
+                    lines.append('    str x0, [sp, #-16]!')
+            for index in range(total):
+                lines.append(f'    ldr x{index}, [sp], #16')
+            lines.append(f'    bl _serenity_{callee}')
+            return lines
         if callee in ALL_BUILTIN_FUNCTIONS:
             if not self._contains_runtime_value(expression):
                 value = self._constant_value(expression)
@@ -933,43 +1001,15 @@ class CodeGen:
                     return [f'    mov x0, #{value}']
                 raise CompileError(f"call '{callee}' produces a non-numeric value")
             return self._compile_runtime_string_builtin(callee, arguments, env)
-        if callee not in self.user_functions:
-            raise CompileError(f"undefined function '{callee}'")
-        function = self.user_functions[callee]
-        if len(arguments) != len(function.params):
-            raise CompileError(f'{callee} expects {len(function.params)} arguments, got {len(arguments)}')
-        param_kinds = self._function_param_kinds(function)
-        starts = []
-        total = 0
-        for argument, kind in zip(arguments, param_kinds):
-            arg_kind = self._static_kind(argument, env)
-            if kind == 'string':
-                if arg_kind != 'string' and arg_kind != 'unknown':
-                    raise CompileError(f"'{callee}' expects a string, got {self._kind_name(arg_kind)}")
-            elif arg_kind == 'string':
-                raise CompileError(f"cannot pass a string to non-string parameter of '{callee}'")
-            starts.append(total)
-            total += self._width(kind)
-        if total > 8:
-            raise CompileError(f'too many arguments ({len(arguments)}), maximum is 8')
-        lines = []
-        for argument, kind in reversed(list(zip(arguments, param_kinds))):
-            lines.extend(self._compile_runtime_expression(argument, env))
-            if kind == 'string':
-                lines.append('    str x1, [sp, #-16]!')
-                lines.append('    str x0, [sp, #-16]!')
-            else:
-                lines.append('    str x0, [sp, #-16]!')
-        for index in range(total):
-            lines.append(f'    ldr x{index}, [sp], #16')
-        lines.append(f'    bl _serenity_{callee}')
-        return lines
+        raise CompileError(f"undefined function '{callee}'")
 
     def _compile_runtime_string_builtin(self, callee, arguments, env=None):
         """Compile string builtins on values only known at runtime."""
         function, arity = ALL_BUILTIN_FUNCTIONS[callee]
         if len(arguments) != arity:
             raise CompileError(f'{callee} expects {arity} argument(s), got {len(arguments)}')
+        if callee not in ('length', 'charAt', 'substring', 'toUpper', 'toLower', 'trim'):
+            raise CompileError(f"builtin '{callee}' is not yet supported at runtime")
         if self._static_kind(arguments[0], env) != 'string':
             raise CompileError(f"builtin '{callee}' is not yet supported inside user-defined functions")
         if callee == 'length':
@@ -1103,7 +1143,7 @@ class CodeGen:
                 return True
             return self._expr_uses_as_string(expression.condition, name, env)
         if isinstance(expression, Call):
-            if expression.callee in ALL_BUILTIN_FUNCTIONS:
+            if expression.callee in STRING_SUBJECT_BUILTINS:
                 if not expression.arguments:
                     return False
                 if self._contains(expression.arguments[0], name):
@@ -1263,6 +1303,8 @@ class CodeGen:
         """True when the expression yields a value only known at runtime."""
         if isinstance(expression, Identifier):
             return expression.name in self.runtime_var_offsets
+        if isinstance(expression, ListLiteral):
+            return any(self._contains_runtime_value(element) for element in expression.elements)
         if isinstance(expression, Call):
             return (expression.callee in self.user_functions
                     or any(self._contains_runtime_value(argument) for argument in expression.arguments))
@@ -1348,6 +1390,8 @@ class CodeGen:
             if suffix:
                 lines.extend(self._write_lines(suffix))
             return lines
+        if isinstance(constant, tuple):
+            return self._write_lines(to_string(constant) + suffix)
         if constant is True or constant is False or constant is None:
             if self._is_runtime_comparison(argument):
                 lines = self._runtime_comparison(argument)
@@ -1431,7 +1475,10 @@ class CodeGen:
             function, arity = STRING_PRODUCING_FUNCTIONS[expression.callee]
             if len(expression.arguments) != arity:
                 raise CompileError(f'{expression.callee} expects {arity} argument(s), got {len(expression.arguments)}')
-            self._constant_value(expression)
+            value = self._constant_value(expression)
+            if isinstance(value, str):
+                label, size = self._new_string(value)
+                return [f'    adrp x0, {label}@PAGE', f'    add x0, x0, {label}@PAGEOFF', f'    mov x1, #{size}']
             helper = {'charAt': '_serenity_char_at', 'substring': '_serenity_substring',
                       'toUpper': '_serenity_to_upper', 'toLower': '_serenity_to_lower',
                       'trim': '_serenity_trim'}[expression.callee]
@@ -1443,7 +1490,14 @@ class CodeGen:
                 lines.append(f'    mov x3, #{self._constant_value(expression.arguments[2])}')
             lines.append(f'    bl {helper}')
             return lines
-        raise CompileError('string expression cannot be compiled at runtime')
+        try:
+            value = self._constant_value(expression)
+        except CompileError:
+            raise CompileError('string expression cannot be compiled at runtime') from None
+        if not isinstance(value, str):
+            raise CompileError('expression does not produce a string')
+        label, size = self._new_string(value)
+        return [f'    adrp x0, {label}@PAGE', f'    add x0, x0, {label}@PAGEOFF', f'    mov x1, #{size}']
 
     def _string_value(self, expression):
         """Resolve compile-time strings, including values introduced by `let`."""
@@ -1457,7 +1511,7 @@ class CodeGen:
 
     @staticmethod
     def _truthy(value):
-        return value is not False and value is not None and value != '' and value != 0
+        return value is not False and value is not None and value != '' and value != 0 and value != ()
 
     def _constant_value(self, expression):
         """Evaluate the compile-time subset, used for typed printed values."""
@@ -1465,6 +1519,8 @@ class CodeGen:
             return expression.value
         if isinstance(expression, NullLiteral):
             return None
+        if isinstance(expression, ListLiteral):
+            return tuple(self._constant_value(element) for element in expression.elements)
         if isinstance(expression, Identifier):
             if expression.name in self.runtime_var_offsets:
                 raise CompileError(f"variable '{expression.name}' holds a runtime value")

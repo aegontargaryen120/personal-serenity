@@ -8,13 +8,13 @@
 - Evaluator (Interpreted): Traverses the AST and evaluates it to a result.
 - Code Generator (Compiled): Traverses the AST and converts it to assembly code, which it saves as a .s file.
 
-* TODO Scanner
-** TODO Implement token definitions
+* DONE Scanner
+** DONE Implement token definitions
 - Create a basic dataclass, Token, and add the fields as necessary:
   - type: What kind of token
   - lexeme: The string in the source corresponding to the current token
   - line, col, idx, filename: metadata
-** TODO Implement token-type enum
+** DONE Implement token-type enum
 - Create a basic enumeration, TokenType.
 - Start with very basic types:
   - INT
@@ -23,42 +23,59 @@
   - PRINT
   - IDENTIFIER
   - EOF -> end of file, basically
-** TODO Implement scanner base class
-*** TODO Initializer
+** DONE Implement scanner base class
+*** DONE Initializer
 - Have the scanner take in the source, and the filename.
 - Assign those values, as well as a line, col, idx, and current (current character).
-*** TODO Helper functions
+*** DONE Helper functions
 - Implement basic functions like advance, and make_token.
-*** TODO Main function
+*** DONE Main function
 - The main function in the scanner will have a very basic loop:
   - Check character
   - Is it a token? If yes, make it and add it to the list of tokens. If no, throw an error.
   - If it's a multicharacter token, loop each character and build out the token.
   - Repeat
 
-* TODO Parser
-** TODO Implement AST Definitions
+* DONE Parser
+** DONE Implement AST Definitions
 - Make these basic classes:
   - BinaryOpNode
   - IntLiteralNode
   - StrLiteralNode
   - IdentLiteralNode
   - PrintStmtNode
-** TODO Implement parser base class
-*** TODO Initializer
+** DONE Implement parser base class
+*** DONE Initializer
 - Have it take in a list of tokens, and assign those.
 - Also have a current variable.
-*** TODO Helper functions
+*** DONE Helper functions
 - Get these following functions:
   - advance: Advances to the next token and returns
   - peek: returns current token without advancing
   - peek_next: returns the next token
-*** TODO Main function
+*** DONE Main function
 - The main function will look at the current token and decide which function to pass it off too.
 - We'll have separate functions for parsing each of the different node types.
 
-* TODO Evaluator
+* DONE Evaluator
 - Implement the evaluator...
 
-* TODO Code generator
+* DONE Code generator
 - I have no idea how to do this.
+
+* TODO Bootstrap the Serenity language in itself
+** TODO Upgrade the standard library
+- Added an immutable list type: `[a, b, c]` literals, polymorphic collection
+  builtins (`length`, `contains`, `indexOf`, `reverse`), list builtins (`at`,
+  `append`, `prepend`, `head`, `tail`, `concat`, `join`, `toString`), list
+  concatenation with `+`, deep equality, and truthiness (empty list is false).
+  Lists are native in the interpreter and fold to constants in the ARM64 code
+  generator; runtime list values in compiled mode raise a clear error.
+- New standard-library module `stdlib/list.srn` with recursive helpers:
+  `range`, `take`, `drop`, `sumList`, `productList`, `minList`, `maxList`,
+  `countItem`, `removeItem`, `removeAll`, `zipLists`, `flatten`,
+  `filterNotNull` (interpreter-only for now).
+- Added `tests/test_lists.py` (45 tests); full suite is 165 tests and green.
+- Removed `reverse`/`reverseRest` from `stdlib/string.srn` in favour of the
+  polymorphic `reverse` builtin.
+** TODO Start building

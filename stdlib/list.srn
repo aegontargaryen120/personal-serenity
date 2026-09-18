@@ -1,0 +1,87 @@
+// Serenity standard-library module: list
+//
+// Immutable-list helpers built on the polymorphic collection builtins
+// (length, contains, indexOf, reverse, toString) and the list-specific
+// builtins (at, append, prepend, head, tail, concat, join). Serenity has no
+// mutable variables, so everything is written recursively; very large inputs
+// will hit the host recursion limit.
+//
+// Expected usage: a program at the project root imports this with
+//     %import <stdlib/list>
+//
+// Exported names: range, take, drop, sumList, productList, minList, maxList,
+//   countItem, removeItem, removeAll, zipLists, flatten, filterNotNull
+
+func range(lo, hi) => (
+    if (lo >= hi) => { return []; }
+    else => { return prepend(range(lo + 1, hi), lo); }
+)
+
+func take(values, n) => (
+    if (n <= 0 || length(values) == 0) => { return []; }
+    else => { return prepend(take(tail(values), n - 1), head(values)); }
+)
+
+func drop(values, n) => (
+    if (n <= 0 || length(values) == 0) => { return values; }
+    else => { return drop(tail(values), n - 1); }
+)
+
+func sumList(values) => (
+    return length(values) == 0 ? 0 : head(values) + sumList(tail(values));
+)
+
+func productList(values) => (
+    return length(values) == 0 ? 1 : head(values) * productList(tail(values));
+)
+
+func minList(values) => (
+    return length(values) == 0 ? 0 : minListStep(tail(values), head(values));
+)
+
+func minListStep(values, best) => (
+    if (length(values) == 0) => { return best; }
+    else => { return minListStep(tail(values), head(values) < best ? head(values) : best); }
+)
+
+func maxList(values) => (
+    return length(values) == 0 ? 0 : maxListStep(tail(values), head(values));
+)
+
+func maxListStep(values, best) => (
+    if (length(values) == 0) => { return best; }
+    else => { return maxListStep(tail(values), head(values) > best ? head(values) : best); }
+)
+
+func countItem(values, item) => (
+    return length(values) == 0 ? 0
+        : (head(values) == item ? 1 : 0) + countItem(tail(values), item);
+)
+
+func removeItem(values, item) => (
+    return length(values) == 0 ? []
+        : head(values) == item ? tail(values)
+        : prepend(removeItem(tail(values), item), head(values));
+)
+
+func removeAll(values, item) => (
+    return length(values) == 0 ? []
+        : head(values) == item ? removeAll(tail(values), item)
+        : prepend(removeAll(tail(values), item), head(values));
+)
+
+func zipLists(left, right) => (
+    return length(left) == 0 || length(right) == 0 ? []
+        : prepend(zipLists(tail(left), tail(right)), [head(left), head(right)]);
+)
+
+func flatten(values) => (
+    return length(values) == 0 ? []
+        : concat(head(values), flatten(tail(values)));
+)
+
+func filterNotNull(values) => (
+    return length(values) == 0 ? []
+        : head(values) == null ? filterNotNull(tail(values))
+        : prepend(filterNotNull(tail(values)), head(values));
+)

@@ -110,3 +110,8 @@ class Conditional:
 class Call:
     callee: str
     arguments: list
+
+
+@dataclass
+class ListLiteral:
+    elements: list

@@ -1,4 +1,4 @@
-from .ast_nodes import Program, Function, ExprStmt, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call
+from .ast_nodes import Program, Function, ExprStmt, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, ListLiteral
 from .scanner import TokenType
 
 
@@ -220,6 +220,15 @@ class Parser:
             return BoolLiteral(False)
         if self._match(TokenType.NULL):
             return NullLiteral()
+        if self._match(TokenType.LBRACKET):
+            elements = []
+            if not self._check(TokenType.RBRACKET):
+                while True:
+                    elements.append(self._expression())
+                    if not self._match(TokenType.COMMA):
+                        break
+            self._consume(TokenType.RBRACKET, "expected ']' after list elements")
+            return ListLiteral(elements)
         if self._match(TokenType.IDENTIFIER):
             name = self._previous().lexeme
             if self._match(TokenType.LPAREN):

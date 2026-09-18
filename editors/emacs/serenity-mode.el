@@ -2,11 +2,11 @@
 
 ;; Copyright (C) 2024
 
-;; Author: Serenity Contributors
+;; Author: Naad K Bhave
 ;; Version: 1.0.0
 ;; Package-Requires: ((emacs "25.1"))
 ;; Keywords: languages, serenity
-;; URL: https://github.com/personal-serenity
+;; URL: https://github.com/aegontargaryen120/personal-serenity.git
 
 ;;; Commentary:
 

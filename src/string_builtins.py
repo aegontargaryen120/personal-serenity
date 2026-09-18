@@ -2,8 +2,11 @@
 
 These pure functions define how the string library behaves. The interpreter
 calls them directly at runtime and the compile-time constant folder uses them
-to fold `length("abc")`, `substring(...)`, etc. into constant values, so the
-two execution modes stay in agreement.
+to fold `substring(...)`, `toUpper(...)`, etc. into constant values, so the two
+execution modes stay in agreement.
+
+`length`, `contains` and `indexOf` are polymorphic (string or list) and live in
+:mod:`src.list_builtins` alongside the list operations.
 """
 
 from .binary_ops import OperationError
