@@ -1,0 +1,64 @@
+#+title: Tasks for Project Serenity
+#+author: Aegon Targaryen
+#+description: The tasks file for the repository.
+
+* An overview of the process
+- Scanner: Converts the source code into a list of meaningful tokens.
+- Parser: Converts the tokens into a data structure called AST.
+- Evaluator (Interpreted): Traverses the AST and evaluates it to a result.
+- Code Generator (Compiled): Traverses the AST and converts it to assembly code, which it saves as a .s file.
+
+* TODO Scanner
+** TODO Implement token definitions
+- Create a basic dataclass, Token, and add the fields as necessary:
+  - type: What kind of token
+  - lexeme: The string in the source corresponding to the current token
+  - line, col, idx, filename: metadata
+** TODO Implement token-type enum
+- Create a basic enumeration, TokenType.
+- Start with very basic types:
+  - INT
+  - STRING
+  - PLUS/MINUS/MULT/DIV
+  - PRINT
+  - IDENTIFIER
+  - EOF -> end of file, basically
+** TODO Implement scanner base class
+*** TODO Initializer
+- Have the scanner take in the source, and the filename.
+- Assign those values, as well as a line, col, idx, and current (current character).
+*** TODO Helper functions
+- Implement basic functions like advance, and make_token.
+*** TODO Main function
+- The main function in the scanner will have a very basic loop:
+  - Check character
+  - Is it a token? If yes, make it and add it to the list of tokens. If no, throw an error.
+  - If it's a multicharacter token, loop each character and build out the token.
+  - Repeat
+
+* TODO Parser
+** TODO Implement AST Definitions
+- Make these basic classes:
+  - BinaryOpNode
+  - IntLiteralNode
+  - StrLiteralNode
+  - IdentLiteralNode
+  - PrintStmtNode
+** TODO Implement parser base class
+*** TODO Initializer
+- Have it take in a list of tokens, and assign those.
+- Also have a current variable.
+*** TODO Helper functions
+- Get these following functions:
+  - advance: Advances to the next token and returns
+  - peek: returns current token without advancing
+  - peek_next: returns the next token
+*** TODO Main function
+- The main function will look at the current token and decide which function to pass it off too.
+- We'll have separate functions for parsing each of the different node types.
+
+* TODO Evaluator
+- Implement the evaluator...
+
+* TODO Code generator
+- I have no idea how to do this.

@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+from src import scanner, parser, evaluator, code_generator
+from src.preprocessor import Preprocessor
+
+def run(source, mode, file=None, base_dir=None):
+    if base_dir is None:
+        base_dir = os.getcwd()
+    preprocessor = Preprocessor(base_dir)
+    source = preprocessor.preprocess(source, file)
+    scan = scanner.Scanner(source, filename=file or '<source>')
+    tokens = scan.scan_tokens()
+    parse = parser.Parser(tokens)
+    ast = parse.parse()
+    if mode == "interpret":
+        evalu = evaluator.Evaluator(ast)
+        evalu.interpret()
+
+    elif mode == "compile":
+        codegen = code_generator.CodeGen(ast)
+        with open(file if file else "output.s", "w") as out:
+            out.write(codegen.generate())
+
+
+def repl():
+    while True:
+        source = input("$ ")
+        run(source, "interpret")
+
+
+def runfile(path):
+    base_dir = os.path.dirname(os.path.abspath(path))
+    with open(path, 'r') as f:
+        run(f.read(), "interpret", file=path, base_dir=base_dir)
+
+
+def main():
+    argc = len(sys.argv)
+
+    if argc == 1:
+        repl()
+    elif argc == 2:
+        runfile(sys.argv[1])
+    elif argc == 4:
+        if sys.argv[2] == '-o':
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[1]))
+            with open(sys.argv[1], "r") as source:
+                run(source.read(), "compile", sys.argv[3], base_dir=base_dir)
+        else:
+            print(f"Unsupported option detected: '{sys.argv[2]}'")
+            sys.exit(1)
+    else:
+        print("Usage: serenity [script]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Serenity Standard Library</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    color: #1f2328;
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 1.5em 2em;
+  }
+  h1 { font-size: 1.8em; border-bottom: 1px solid #d1d9e0; padding-bottom: .3em; }
+  h2 { font-size: 1.4em; border-bottom: 1px solid #d8dee4; padding-bottom: .2em; margin-top: 1.5em; }
+  code {
+    background: #f6f8fa;
+    border-radius: 4px;
+    padding: .15em .35em;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .95em;
+  }
+  th, td {
+    border: 1px solid #d1d9e0;
+    padding: .4em .7em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #f6f8fa; white-space: nowrap; }
+  .note {
+    background: #fff8c5;
+    border: 1px solid #d4a72c;
+    border-radius: 6px;
+    padding: .5em .8em;
+    font-size: .9em;
+    color: #5a4700;
+  }
+</style>
+</head>
+<body>
+
+<h1>Serenity Standard Library</h1>
+
+<p>The standard library ships as Serenity source modules (<code>.srn</code>) in the
+<code>stdlib/</code> directory. A program at the project root imports a module with:</p>
+<pre><code>%import &lt;stdlib/util&gt;
+%import &lt;stdlib/string&gt;
+%import &lt;stdlib/math&gt;</code></pre>
+
+<div class="note"><strong>Note:</strong> Serenity has no mutable variables, so functions
+that accumulate values are written recursively; very large inputs can hit the host
+recursion limit.</div>
+
+<h2>Modules</h2>
+<table>
+  <tr>
+    <th>File</th>
+    <th>Purpose</th>
+  </tr>
+  <tr>
+    <td><code>stdlib/util.srn</code></td>
+    <td>Identity, boolean, and null helpers for concise expressions</td>
+  </tr>
+  <tr>
+    <td><code>stdlib/string.srn</code></td>
+    <td>String utilities built on the core string builtins</td>
+  </tr>
+  <tr>
+    <td><code>stdlib/math.srn</code></td>
+    <td>Integer helpers built from the core operators and builtins</td>
+  </tr>
+</table>
+
+<h2>util.srn</h2>
+<p>Small identity, boolean, and null helpers. Exported names: <code>identity</code>, <code>not</code>,
+<code>bool</code>, <code>isNull</code>, <code>notNull</code>, <code>isZero</code>, <code>nonZero</code>, <code>isEmptyText</code>,
+<code>firstOf</code>, <code>secondOf</code>, <code>toggle</code>, <code>isEqual</code>, <code>isNotEqual</code>, <code>countRange</code>.</p>
+<table>
+  <tr><th>Function</th><th>Signature</th><th>Description</th></tr>
+  <tr><td><code>identity</code></td><td><code>identity(x)</code></td><td>Returns its argument unchanged.</td></tr>
+  <tr><td><code>not</code></td><td><code>not(x)</code></td><td>Logical negation of <code>x</code>.</td></tr>
+  <tr><td><code>bool</code></td><td><code>bool(x)</code></td><td>Coerces <code>x</code> to a boolean (<code>!(!x)</code>).</td></tr>
+  <tr><td><code>isNull</code></td><td><code>isNull(x)</code></td><td>True if <code>x == null</code>.</td></tr>
+  <tr><td><code>notNull</code></td><td><code>notNull(x)</code></td><td>True if <code>x != null</code>.</td></tr>
+  <tr><td><code>isZero</code></td><td><code>isZero(x)</code></td><td>True if <code>x == 0</code>.</td></tr>
+  <tr><td><code>nonZero</code></td><td><code>nonZero(x)</code></td><td>True if <code>x != 0</code>.</td></tr>
+  <tr><td><code>isEmptyText</code></td><td><code>isEmptyText(x)</code></td><td>True if <code>x == ""</code> (empty string).</td></tr>
+  <tr><td><code>firstOf</code></td><td><code>firstOf(a, b)</code></td><td>Returns <code>a</code> if not null, otherwise <code>b</code>.</td></tr>
+  <tr><td><code>secondOf</code></td><td><code>secondOf(a, b)</code></td><td>Returns <code>b</code> if not null, otherwise <code>a</code>.</td></tr>
+  <tr><td><code>toggle</code></td><td><code>toggle(x)</code></td><td>Flips between <code>0</code> and <code>1</code>.</td></tr>
+  <tr><td><code>isEqual</code></td><td><code>isEqual(a, b)</code></td><td>True if <code>a == b</code>.</td></tr>
+  <tr><td><code>isNotEqual</code></td><td><code>isNotEqual(a, b)</code></td><td>True if <code>a != b</code>.</td></tr>
+  <tr><td><code>countRange</code></td><td><code>countRange(lo, hi)</code></td><td>Number of integers in <code>[lo, hi]</code> inclusive, or <code>0</code> if empty.</td></tr>
+</table>
+
+<h2>string.srn</h2>
+<p>String utilities built on the core string builtins (<code>length</code>, <code>charAt</code>,
+<code>substring</code>, <code>toUpper</code>, <code>toLower</code>, <code>trim</code>, <code>contains</code>, <code>indexOf</code>, <code>toInt</code>).
+Exported names: <code>isEmpty</code>, <code>reverse</code>, <code>startsWith</code>, <code>endsWith</code>, <code>repeat</code>,
+<code>capitalize</code>, <code>titleCase</code>, <code>replace</code>, <code>countOccurrences</code>, <code>ltrim</code>, <code>rtrim</code>,
+<code>padLeft</code>, <code>padRight</code>, <code>truncate</code>, <code>wordCount</code>.</p>
+<table>
+  <tr><th>Function</th><th>Signature</th><th>Description</th></tr>
+  <tr><td><code>isEmpty</code></td><td><code>isEmpty(s)</code></td><td>True if <code>s</code> has length 0.</td></tr>
+  <tr><td><code>reverse</code></td><td><code>reverse(s)</code></td><td>Returns <code>s</code> with characters in reverse order.</td></tr>
+  <tr><td><code>startsWith</code></td><td><code>startsWith(s, prefix)</code></td><td>True if <code>s</code> begins with <code>prefix</code>.</td></tr>
+  <tr><td><code>endsWith</code></td><td><code>endsWith(s, suffix)</code></td><td>True if <code>s</code> ends with <code>suffix</code>.</td></tr>
+  <tr><td><code>repeat</code></td><td><code>repeat(s, n)</code></td><td>Returns <code>s</code> repeated <code>n</code> times (empty for <code>n &le; 0</code>).</td></tr>
+  <tr><td><code>capitalize</code></td><td><code>capitalize(s)</code></td><td>Uppercases the first character of <code>s</code>.</td></tr>
+  <tr><td><code>titleCase</code></td><td><code>titleCase(s)</code></td><td>Title-cases words: first letter upper, rest lower.</td></tr>
+  <tr><td><code>replace</code></td><td><code>replace(s, from, to)</code></td><td>Replaces all (non-overlapping) occurrences of <code>from</code> with <code>to</code>.</td></tr>
+  <tr><td><code>countOccurrences</code></td><td><code>countOccurrences(s, needle)</code></td><td>Count of non-overlapping occurrences of <code>needle</code>.</td></tr>
+  <tr><td><code>ltrim</code></td><td><code>ltrim(s)</code></td><td>Strips leading space characters only.</td></tr>
+  <tr><td><code>rtrim</code></td><td><code>rtrim(s)</code></td><td>Strips trailing space characters only.</td></tr>
+  <tr><td><code>padLeft</code></td><td><code>padLeft(s, width, pad)</code></td><td>Pads <code>s</code> on the left up to <code>width</code> using <code>pad</code>.</td></tr>
+  <tr><td><code>padRight</code></td><td><code>padRight(s, width, pad)</code></td><td>Pads <code>s</code> on the right up to <code>width</code> using <code>pad</code>.</td></tr>
+  <tr><td><code>truncate</code></td><td><code>truncate(s, width)</code></td><td>Truncates <code>s</code> to at most <code>width</code> characters.</td></tr>
+  <tr><td><code>wordCount</code></td><td><code>wordCount(s)</code></td><td>Counts words, where spaces separate tokens (use <code>trim</code> for general whitespace).</td></tr>
+</table>
+
+<p><code>ltrim</code> and <code>rtrim</code> only strip literal space characters; use the
+<code>trim</code> builtin for general whitespace.</p>
+
+<h2>math.srn</h2>
+<p>Integer helpers built from the core operators (<code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>%</code>, <code>^</code>)
+and builtin functions. Exported names: <code>mult</code>, <code>div</code>, <code>abs</code>, <code>min</code>, <code>max</code>,
+<code>min3</code>, <code>max3</code>, <code>clamp</code>, <code>sign</code>, <code>pow</code>, <code>sqr</code>, <code>cube</code>, <code>mod</code>,
+<code>even</code>, <code>odd</code>, <code>gcd</code>, <code>lcm</code>, <code>fact</code>, <code>isPrime</code>, <code>isBetween</code>,
+<code>divisibleBy</code>, <code>fib</code>, <code>digitSum</code>, <code>triangle</code>.</p>
+<table>
+  <tr><th>Function</th><th>Signature</th><th>Description</th></tr>
+  <tr><td><code>mult</code></td><td><code>mult(a, b)</code></td><td>Product of <code>a</code> and <code>b</code>.</td></tr>
+  <tr><td><code>div</code></td><td><code>div(a, b)</code></td><td>Integer division, guards against division by zero.</td></tr>
+  <tr><td><code>abs</code></td><td><code>abs(n)</code></td><td>Absolute value of <code>n</code>.</td></tr>
+  <tr><td><code>min</code></td><td><code>min(a, b)</code></td><td>Smaller of <code>a</code> and <code>b</code>.</td></tr>
+  <tr><td><code>max</code></td><td><code>max(a, b)</code></td><td>Larger of <code>a</code> and <code>b</code>.</td></tr>
+  <tr><td><code>min3</code></td><td><code>min3(a, b, c)</code></td><td>Smallest of three values.</td></tr>
+  <tr><td><code>max3</code></td><td><code>max3(a, b, c)</code></td><td>Largest of three values.</td></tr>
+  <tr><td><code>clamp</code></td><td><code>clamp(n, lo, hi)</code></td><td>Clamps <code>n</code> into <code>[lo, hi]</code>.</td></tr>
+  <tr><td><code>sign</code></td><td><code>sign(n)</code></td><td>Returns <code>-1</code>, <code>0</code>, or <code>1</code>.</td></tr>
+  <tr><td><code>pow</code></td><td><code>pow(base, exp)</code></td><td><code>base ^ exp</code>; rejects negative exponents.</td></tr>
+  <tr><td><code>sqr</code></td><td><code>sqr(n)</code></td><td><code>n * n</code>.</td></tr>
+  <tr><td><code>cube</code></td><td><code>cube(n)</code></td><td><code>n * n * n</code>.</td></tr>
+  <tr><td><code>mod</code></td><td><code>mod(a, b)</code></td><td><code>a % b</code>; guards against modulus by zero.</td></tr>
+  <tr><td><code>even</code></td><td><code>even(n)</code></td><td>True if <code>n</code> is even.</td></tr>
+  <tr><td><code>odd</code></td><td><code>odd(n)</code></td><td>True if <code>n</code> is odd.</td></tr>
+  <tr><td><code>gcd</code></td><td><code>gcd(a, b)</code></td><td>Greatest common divisor.</td></tr>
+  <tr><td><code>lcm</code></td><td><code>lcm(a, b)</code></td><td>Least common multiple (0 if either argument is 0).</td></tr>
+  <tr><td><code>fact</code></td><td><code>fact(n)</code></td><td>Factorial; undefined for negative numbers.</td></tr>
+  <tr><td><code>isPrime</code></td><td><code>isPrime(n)</code></td><td>True if <code>n</code> is prime.</td></tr>
+  <tr><td><code>isBetween</code></td><td><code>isBetween(n, lo, hi)</code></td><td>True if <code>lo &le; n &le; hi</code>.</td></tr>
+  <tr><td><code>divisibleBy</code></td><td><code>divisibleBy(a, b)</code></td><td>True if <code>a</code> is divisible by nonzero <code>b</code>.</td></tr>
+  <tr><td><code>fib</code></td><td><code>fib(n)</code></td><td>Fibonacci number (iterative); 0 for negative <code>n</code>.</td></tr>
+  <tr><td><code>digitSum</code></td><td><code>digitSum(n)</code></td><td>Sum of the decimal digits of <code>n</code>.</td></tr>
+  <tr><td><code>triangle</code></td><td><code>triangle(n)</code></td><td>Triangular number <code>n(n+1)/2</code>; 0 for negative <code>n</code>.</td></tr>
+</table>
+
+</body>
+</html>

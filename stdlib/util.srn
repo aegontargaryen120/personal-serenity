@@ -1,0 +1,67 @@
+// Serenity standard-library module: util
+//
+// Small identity, boolean and null helpers for writing concise expressions.
+// They exist because the language only has `||`/`&&` for logic and booleans
+// are first-class values that can be returned and compared.
+//
+// Expected usage: a program at the project root imports this with
+//     %import <stdlib/util>
+//
+// Exported names: identity, not, bool, isNull, notNull, isZero, nonZero,
+//   isEmptyText, firstOf, secondOf, toggle, isEqual, isNotEqual, countRange
+
+func identity(x) => (
+    return x;
+)
+
+func not(x) => (
+    return !x;
+)
+
+func bool(x) => (
+    return !(!x);
+)
+
+func isNull(x) => (
+    return x == null;
+)
+
+func notNull(x) => (
+    return x != null;
+)
+
+func isZero(x) => (
+    return x == 0;
+)
+
+func nonZero(x) => (
+    return x != 0;
+)
+
+func isEmptyText(x) => (
+    return x == "";
+)
+
+func firstOf(a, b) => (
+    return a != null ? a : b;
+)
+
+func secondOf(a, b) => (
+    return b != null ? b : a;
+)
+
+func toggle(x) => (
+    return x == 0 ? 1 : 0;
+)
+
+func isEqual(a, b) => (
+    return a == b;
+)
+
+func isNotEqual(a, b) => (
+    return a != b;
+)
+
+func countRange(lo, hi) => (
+    return lo <= hi ? hi - lo + 1 : 0;
+)

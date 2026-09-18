@@ -1,0 +1,185 @@
+// Serenity standard-library module: string
+//
+// String utilities built on the core string builtins (length, charAt,
+// substring, toUpper, toLower, trim, contains, indexOf, toInt). Serenity has
+// no mutable variables, so every builder here is written recursively; very
+// long inputs will hit the host recursion limit. ltrim/rtrim only strip
+// literal space characters (use the trim builtin for general whitespace).
+//
+// Expected usage: a program at the project root imports this with
+//     %import <stdlib/string>
+//
+// Exported names: isEmpty, reverse, startsWith, endsWith, repeat, capitalize,
+//   titleCase, replace, countOccurrences, ltrim, rtrim, padLeft, padRight,
+//   truncate, wordCount
+
+func isEmpty(s) => (
+    return length(s) == 0;
+)
+
+func reverse(s) => (
+    return reverseRest(s, length(s) - 1);
+)
+
+func reverseRest(s, i) => (
+    if (i < 0) => {
+        return "";
+    } else => {
+        return charAt(s, i) + reverseRest(s, i - 1);
+    }
+)
+
+func startsWith(s, prefix) => (
+    return length(prefix) <= length(s) && substring(s, 0, length(prefix)) == prefix;
+)
+
+func endsWith(s, suffix) => (
+    return length(suffix) <= length(s)
+        && substring(s, length(s) - length(suffix), length(s)) == suffix;
+)
+
+func repeat(s, n) => (
+    if (n <= 0) => {
+        return "";
+    } else => {
+        return s + repeat(s, n - 1);
+    }
+)
+
+func capitalize(s) => (
+    if (length(s) == 0) => {
+        return s;
+    } else => {
+        return toUpper(charAt(s, 0)) + substring(s, 1, length(s));
+    }
+)
+
+func titleCase(s) => (
+    return titleStep(s, 0, 1);
+)
+
+func titleStep(s, i, cap) => (
+    if (i >= length(s)) => {
+        return "";
+    } else => {
+        if (charAt(s, i) == " ") => {
+            return " " + titleStep(s, i + 1, 1);
+        } else => {
+            if (cap == 1) => {
+                return toUpper(charAt(s, i)) + titleStep(s, i + 1, 0);
+            } else => {
+                return toLower(charAt(s, i)) + titleStep(s, i + 1, 0);
+            }
+        }
+    }
+)
+
+func replace(s, from, to) => (
+    if (length(from) == 0) => {
+        return s;
+    } else => {
+        return replaceFrom(s, from, to, 0);
+    }
+)
+
+func replaceFrom(s, from, to, i) => (
+    if (i >= length(s)) => {
+        return "";
+    } else => {
+        if (i + length(from) <= length(s)
+            && substring(s, i, i + length(from)) == from) => {
+            return to + replaceFrom(s, from, to, i + length(from));
+        } else => {
+            return charAt(s, i) + replaceFrom(s, from, to, i + 1);
+        }
+    }
+)
+
+func countOccurrences(s, needle) => (
+    if (length(needle) == 0) => {
+        return length(s) + 1;
+    } else => {
+        return occurrencesFrom(s, needle, 0);
+    }
+)
+
+func occurrencesFrom(s, needle, i) => (
+    if (i >= length(s)) => {
+        return 0;
+    } else => {
+        if (i + length(needle) <= length(s)
+            && substring(s, i, i + length(needle)) == needle) => {
+            return 1 + occurrencesFrom(s, needle, i + length(needle));
+        } else => {
+            return occurrencesFrom(s, needle, i + 1);
+        }
+    }
+)
+
+func ltrim(s) => (
+    if (length(s) == 0) => {
+        return s;
+    } else => {
+        if (charAt(s, 0) == " ") => {
+            return ltrim(substring(s, 1, length(s)));
+        } else => {
+            return s;
+        }
+    }
+)
+
+func rtrim(s) => (
+    if (length(s) == 0) => {
+        return s;
+    } else => {
+        if (charAt(s, length(s) - 1) == " ") => {
+            return rtrim(substring(s, 0, length(s) - 1));
+        } else => {
+            return s;
+        }
+    }
+)
+
+func padLeft(s, width, pad) => (
+    if (length(s) >= width || length(pad) == 0) => {
+        return s;
+    } else => {
+        return truncate(repeat(pad, width - length(s)) + s, width);
+    }
+)
+
+func padRight(s, width, pad) => (
+    if (length(s) >= width || length(pad) == 0) => {
+        return s;
+    } else => {
+        return truncate(s + repeat(pad, width - length(s)), width);
+    }
+)
+
+func truncate(s, width) => (
+    if (length(s) <= width) => {
+        return s;
+    } else => {
+        return substring(s, 0, width);
+    }
+)
+
+func wordCount(s) => (
+    return wordStep(s, 0, 0);
+)
+
+func wordStep(s, i, inWord) => (
+    if (i >= length(s)) => {
+        return 0;
+    } else => {
+        if (charAt(s, i) == " ") => {
+            return wordStep(s, i + 1, 0);
+        } else => {
+            if (inWord == 1) => {
+                return wordStep(s, i + 1, 1);
+            } else => {
+                return 1 + wordStep(s, i + 1, 1);
+            }
+        }
+    }
+)

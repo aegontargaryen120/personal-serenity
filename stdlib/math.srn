@@ -1,0 +1,208 @@
+// Serenity standard-library module: math
+//
+// Integer helpers built from the core operators (+, -, *, /, % and ^) and the
+// builtin functions. Serenity has no mutable variables, so anything that
+// accumulates (gcd, digitSum, fib, isPrime...) is written recursively; very
+// large inputs will hit the host recursion limit.
+//
+// Expected usage: a program at the project root imports this with
+//     %import <stdlib/math>
+//
+// Exported names: mult, div, abs, min, max, min3, max3, clamp, sign, pow,
+//   sqr, cube, mod, even, odd, gcd, lcm, fact, isPrime, isBetween,
+//   divisibleBy, fib, digitSum, triangle
+
+func mult(a, b) => (
+    return a * b;
+)
+
+func div(a, b) => (
+    if (b != 0) => {
+        return a / b;
+    } else => {
+        println("ERROR: Division by zero is not allowed!");
+        return 0;
+    }
+)
+
+func abs(n) => (
+    return n < 0 ? -n : n;
+)
+
+func min(a, b) => (
+    return a < b ? a : b;
+)
+
+func max(a, b) => (
+    return a > b ? a : b;
+)
+
+func min3(a, b, c) => (
+    return min(min(a, b), c);
+)
+
+func max3(a, b, c) => (
+    return max(max(a, b), c);
+)
+
+func clamp(n, lo, hi) => (
+    if (n < lo) => {
+        return lo;
+    } else => {
+        if (n > hi) => {
+            return hi;
+        } else => {
+            return n;
+        }
+    }
+)
+
+func sign(n) => (
+    if (n < 0) => {
+        return -1;
+    } else => {
+        if (n > 0) => {
+            return 1;
+        } else => {
+            return 0;
+        }
+    }
+)
+
+func pow(base, exp) => (
+    if (exp < 0) => {
+        println("ERROR: pow does not support negative exponents");
+        return 0;
+    }
+    else => {
+        return base ^ exp;
+    }
+)
+
+func sqr(n) => (
+    return n * n;
+)
+
+func cube(n) => (
+    return n * n * n;
+)
+
+func mod(a, b) => (
+    if (b == 0) => {
+        println("ERROR: mod by zero");
+        return 0;
+    }
+    else => {
+        return a % b;
+    }
+)
+
+func even(n) => (
+    return n % 2 == 0;
+)
+
+func odd(n) => (
+    return n % 2 != 0;
+)
+
+func gcd(a, b) => (
+    let x = abs(a);
+    let y = abs(b);
+    return gcdImpl(x, y);
+)
+
+func gcdImpl(x, y) => (
+    if (y == 0) => {
+        return x;
+    } else => {
+        return gcdImpl(y, x % y);
+    }
+)
+
+func lcm(a, b) => (
+    if (a == 0 || b == 0) => {
+        return 0;
+    }
+    else => {
+        return abs(a * b / gcd(a, b));
+    }
+)
+
+func fact(n) => (
+    if (n < 0) => {
+        println("ERROR: factorial of a negative number is undefined");
+        return 0;
+    }
+    else => {
+        if (n <= 1) => {
+            return 1;
+        } else => {
+            return n * fact(n - 1);
+        }
+    }
+)
+
+func isPrime(n) => (
+    if (n <= 1) => {
+        return false;
+    } else => {
+        if (even(n)) => {
+            return n == 2;
+        } else => {
+            return hasDivisor(n, 3);
+        }
+    }
+)
+
+func hasDivisor(n, i) => (
+    if (i * i > n) => {
+        return true;
+    } else => {
+        if (n % i == 0) => {
+            return false;
+        } else => {
+            return hasDivisor(n, i + 2);
+        }
+    }
+)
+
+func isBetween(n, lo, hi) => (
+    return n >= lo && n <= hi;
+)
+
+func divisibleBy(a, b) => (
+    return b != 0 && a % b == 0;
+)
+
+func fib(n) => (
+    if (n < 0) => {
+        return 0;
+    }
+    else => {
+        return fibStep(n, 0, 1);
+    }
+)
+
+func fibStep(n, a, b) => (
+    if (n == 0) => {
+        return a;
+    } else => {
+        return fibStep(n - 1, b, a + b);
+    }
+)
+
+func digitSum(n) => (
+    return digitSumAbs(abs(n));
+)
+
+func digitSumAbs(n) => (
+    if (n == 0) => {
+        return 0;
+    } else => {
+        return n % 10 + digitSumAbs(n / 10);
+    }
+)
+
+func triangle(n) => (
+    return n < 0 ? 0 : n * (n + 1) / 2;
+)

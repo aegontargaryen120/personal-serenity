@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Serenity Mode for Emacs</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    color: #1f2328;
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 1.5em 2em;
+  }
+  h1 { font-size: 1.8em; border-bottom: 1px solid #d1d9e0; padding-bottom: .3em; }
+  h2 { font-size: 1.4em; border-bottom: 1px solid #d8dee4; padding-bottom: .2em; margin-top: 1.5em; }
+  h3 { font-size: 1.15em; margin-top: 1.3em; }
+  code {
+    background: #f6f8fa;
+    border-radius: 4px;
+    padding: .15em .35em;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+  }
+  pre {
+    background: #f6f8fa;
+    border-radius: 6px;
+    padding: 1em;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    font-size: .95em;
+  }
+  th, td {
+    border: 1px solid #d1d9e0;
+    padding: .4em .7em;
+    text-align: left;
+  }
+  th { background: #f6f8fa; }
+  blockquote {
+    margin: 1em 0;
+    padding: .25em 1em;
+    border-left: 4px solid #d1d9e0;
+    color: #57606a;
+  }
+  a { color: #0969da; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .file-structure {
+    background: #f6f8fa;
+    border-radius: 6px;
+    padding: 1em;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .9em;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+
+<h1>Serenity Mode for Emacs</h1>
+
+<p>Major mode for editing the Serenity programming language (<code>.serenity</code> and <code>.srn</code> files).</p>
+
+<h2>Features</h2>
+<ul>
+  <li><strong>Syntax highlighting</strong> &mdash; keywords, built-in functions, constants, strings, numbers, function names, and the <code>=&gt;</code> arrow</li>
+  <li><strong>Automatic indentation</strong> &mdash; respects <code>=&gt;</code>, <code>{</code>, and <code>(</code> openers and <code>}</code>/<code>)</code> closers</li>
+  <li><strong>REPL interaction</strong> &mdash; interactive <code>$</code> prompt via comint (run <code>func main() =&gt; (...)</code> programs)</li>
+  <li><strong>Compilation</strong> &mdash; compile to ARM64 assembly or assemble+run with <code>clang</code> (macOS ARM64)</li>
+  <li><strong>Electric pairs</strong> &mdash; <code>"</code> <code>()</code> <code>{}</code> <code>[]</code> auto-close</li>
+  <li><strong>Imenu</strong> &mdash; jump to function definitions with <code>imenu</code> (works with Helm, Ivy, Vertico, etc.)</li>
+  <li><strong>Outline / folding</strong> &mdash; <code>outline-regexp</code> matches <code>func</code> definitions for <code>outline-minor-mode</code> / hideshow</li>
+</ul>
+
+<h2>Requirements</h2>
+<ul>
+  <li>Emacs 25.1 or later</li>
+  <li>Python 3 (<code>python3</code> on your <code>PATH</code>)</li>
+  <li>The <code>serenity</code> runner script in the project root (same directory as <code>src/</code>)</li>
+</ul>
+
+<h2>Installation</h2>
+
+<h3>Manual</h3>
+<p>Copy <code>editors/emacs/serenity-mode.el</code> into your Emacs load path:</p>
+<pre><code>mkdir -p ~/.emacs.d/lisp/
+cp editors/emacs/serenity-mode.el ~/.emacs.d/lisp/</code></pre>
+
+<p>Add to your init file (<code>~/.emacs</code> or <code>~/.config/emacs/init.el</code>):</p>
+<pre><code>(add-to-list 'load-path "~/.emacs.d/lisp/")
+(require 'serenity-mode)</code></pre>
+
+<p>Restart Emacs or evaluate the forms with <code>M-x eval-buffer</code>.</p>
+
+<h3>use-package</h3>
+<pre><code>(use-package serenity-mode
+  :load-path "~/.emacs.d/lisp/"
+  :mode (("\\.serenity\\'" . serenity-mode)
+         ("\\.srn\\'" . serenity-mode)))</code></pre>
+
+<h3>Project-local</h3>
+<p>Place <code>.dir-locals.el</code> in the project root:</p>
+<pre><code>((serenity-mode . ((serenity-runner-file . "/path/to/serenity"))))</code></pre>
+
+<h2>Configuration</h2>
+<table>
+  <tr>
+    <th>Variable</th>
+    <th>Default</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td><code>serenity-executable</code></td>
+    <td><code>"python3"</code></td>
+    <td>Path to the Python interpreter</td>
+  </tr>
+  <tr>
+    <td><code>serenity-runner-file</code></td>
+    <td><code>nil</code></td>
+    <td>Explicit path to the <code>serenity</code> runner; auto-detected from the project root if nil</td>
+  </tr>
+  <tr>
+    <td><code>serenity-indent-offset</code></td>
+    <td><code>4</code></td>
+    <td>Spaces per indentation level</td>
+  </tr>
+</table>
+
+<h2>Key Bindings</h2>
+
+<h3>Major Mode (<code>serenity-mode-map</code>)</h3>
+<table>
+  <tr>
+    <th>Key</th>
+    <th>Command</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td><code>C-c C-c</code></td>
+    <td><code>serenity-compile</code></td>
+    <td>Compile to ARM64 assembly (<code>.s</code>)</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-r</code></td>
+    <td><code>serenity-compile-run</code></td>
+    <td>Compile + assemble + run</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-z</code></td>
+    <td><code>serenity-repl</code></td>
+    <td>Start or switch to the <code>$</code> REPL</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-e</code></td>
+    <td><code>serenity-send-line</code></td>
+    <td>Send current line to the REPL</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-y</code></td>
+    <td><code>serenity-send-region</code></td>
+    <td>Send active region to the REPL</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-b</code></td>
+    <td><code>serenity-send-buffer</code></td>
+    <td>Send entire buffer to the REPL</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-n</code></td>
+    <td><code>serenity-next-function</code></td>
+    <td>Jump to next <code>func</code> definition</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-p</code></td>
+    <td><code>serenity-previous-function</code></td>
+    <td>Jump to previous <code>func</code> definition</td>
+  </tr>
+</table>
+
+<h3>REPL Minor Mode (<code>serenity-repl-minor-mode</code>, active in all Serenity buffers)</h3>
+<table>
+  <tr>
+    <th>Key</th>
+    <th>Command</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td><code>C-c C-s C-e</code></td>
+    <td><code>serenity-send-line</code></td>
+    <td>Send line to REPL</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-s C-b</code></td>
+    <td><code>serenity-send-buffer</code></td>
+    <td>Send buffer to REPL</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-s C-r</code></td>
+    <td><code>serenity-send-region</code></td>
+    <td>Send region to REPL</td>
+  </tr>
+  <tr>
+    <td><code>C-c C-s C-z</code></td>
+    <td><code>serenity-repl</code></td>
+    <td>Start/switch to REPL</td>
+  </tr>
+</table>
+
+<h2>Usage</h2>
+
+<h3>Editing</h3>
+<p>Open any <code>.serenity</code> or <code>.srn</code> file &mdash; the mode activates automatically:</p>
+<pre><code>$ emacs hello.serenity
+$ emacs stdlib/math.srn</code></pre>
+
+<p>Type freely; after pressing <code>RET</code>, the next line auto-indents according to the
+block structure. Closing braces and parens dedent automatically when <code>electric-indent-mode</code>
+re-indents the line after the <code>}</code> or <code>)</code> is typed.</p>
+
+<h3>REPL</h3>
+<p>Press <code>C-c C-z</code> to start the Serenity REPL. The REPL launches the Serenity
+runner (<code>python3 serenity</code>) in the project root, giving you the <code>$</code> prompt.</p>
+
+<blockquote>
+<p><strong>Note:</strong> Serenity programs are function definitions. Each line sent to the REPL
+must be a complete program, e.g.:</p>
+<pre><code>$ func main() =&gt; ( println(1 + 2); )
+3
+$</code></pre>
+</blockquote>
+
+<p>You can also run the current buffer by compiling with <code>C-c C-c</code> and viewing
+the <code>*compilation*</code> buffer output.</p>
+
+<h3>Compilation</h3>
+<p><code>C-c C-c</code> compiles the current <code>.serenity</code>/<code>.srn</code> file to ARM64 assembly (<code>.s</code>):</p>
+<pre><code>python3 serenity hello.serenity -o hello.s</code></pre>
+
+<p><code>C-c C-r</code> compiles, assembles with <code>clang</code>, and runs the binary &mdash; useful for
+testing on macOS ARM64.</p>
+
+<h3>Comments</h3>
+<p><code>M-;</code> comments or uncomments the current line or region (uses <code>//</code> style).</p>
+
+<h3>Navigation</h3>
+<p><code>C-c C-n</code> / <code>C-c C-p</code> jump between <code>func</code> definitions. <code>M-x imenu</code> presents
+a menu of all functions in the current buffer.</p>
+
+<h2>File Structure</h2>
+<div class="file-structure">editors/emacs/
+  serenity-mode.el    <span style="color:#57606a">-- the Emacs package (place on load-path)</span>
+emacs-instr.md        <span style="color:#57606a">-- this file</span></div>
+
+</body>
+</html>
