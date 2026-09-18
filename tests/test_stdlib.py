@@ -2,10 +2,6 @@
 
 The standard library is written as ordinary Serenity functions and exercised
 through the interpreter, the same path a program takes via `serenity prog`.
-The ARM64 compiler only supports a small subset of user-defined function bodies
-(string literals and some control flow inside user functions are still
-unimplemented), so there are no compiled-parity tests here; the interpreter's
-output is asserted directly.
 """
 import io
 import os

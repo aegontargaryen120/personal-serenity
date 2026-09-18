@@ -10,7 +10,7 @@ genuinely computed at runtime: string concatenation and the string library are
 emitted as calls to `_serenity_*` subroutines that malloc and build actual byte
 buffers when the program runs.
 """
-from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, LetStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, ExprStmt, Function
+from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, ExprStmt, Function
 from .binary_ops import apply as apply_operator, OperationError
 from .string_builtins import (
     length, char_at, substring, to_upper, to_lower, trim, contains, index_of, to_int,
@@ -52,6 +52,8 @@ class CodeGen:
         self.runtime_var_types = {}
         self.runtime_next_var = 0
         self.return_label = None
+        self._param_kind_cache = {}
+        self._return_kind_cache = {}
 
     def generate(self):
         mains = [function for function in self.program.functions if function.name == 'main']
@@ -410,13 +412,32 @@ class CodeGen:
                         raise CompileError("let with a user-defined function call inside a block is not yet supported")
                     offset = 16 + 8 * self.runtime_next_var
                     self.runtime_var_offsets[statement.name] = offset
-                    self.runtime_var_types[statement.name] = self._classify_runtime_type(statement.initializer)
-                    self.runtime_next_var += 1
-                    body.extend(self._compile_runtime_expression(statement.initializer))
-                    body.append(f'    str x0, [x29, #{offset}]')
+                    kind = self._static_kind(statement.initializer, self._current_env())
+                    self.runtime_var_types[statement.name] = kind
+                    self.runtime_next_var += self._width(kind)
+                    body.extend(self._compile_runtime_expression(statement.initializer, self._current_env()))
+                    body.extend(self._store_runtime_var(statement.name))
                 else:
                     self._validate_initializer(statement.initializer)
                     self.variables[statement.name] = statement.initializer
+            elif isinstance(statement, AssignStmt):
+                if statement.name in self.runtime_var_offsets:
+                    body.extend(self._compile_runtime_expression(statement.value))
+                    body.extend(self._store_runtime_var(statement.name))
+                elif statement.name in self.variables:
+                    kind = self._static_kind(statement.value)
+                    previous = self.variables[statement.name]
+                    offset = 16 + 8 * self.runtime_next_var
+                    self.runtime_var_offsets[statement.name] = offset
+                    self.runtime_var_types[statement.name] = kind
+                    self.runtime_next_var += self._width(kind)
+                    del self.variables[statement.name]
+                    body.extend(self._compile_runtime_expression(previous))
+                    body.extend(self._store_runtime_var(statement.name))
+                    body.extend(self._compile_runtime_expression(statement.value))
+                    body.extend(self._store_runtime_var(statement.name))
+                else:
+                    raise CompileError(f"undefined variable '{statement.name}'")
             elif isinstance(statement, IfStmt):
                 condition = self._constant_value(statement.condition)
                 branch = statement.then_branch if self._truthy(condition) else statement.else_branch
@@ -441,7 +462,8 @@ class CodeGen:
                 raise CompileError(f'cannot compile statement {statement!r}')
         if scoped:
             for name in saved_variables:
-                saved_variables[name] = self.variables[name]
+                if name in self.variables:
+                    saved_variables[name] = self.variables[name]
             self.variables = saved_variables
         return body
 
@@ -484,20 +506,30 @@ class CodeGen:
 
         Parameters arrive in x0..x7 per the ARM64 calling convention and are
         saved to the function's stack frame so the body can read and write
-        them. The body is compiled for true runtime execution; the value left
-        in x0 by the final expression is the return value.
+        them. A string value occupies two registers (pointer in the first,
+        length in the second) and two stack slots. The body is compiled for
+        true runtime execution; the value left in x0 (and x1 for strings) by
+        the final expression is the return value.
         """
         saved_state = (self.runtime_var_offsets, self.runtime_var_types, self.runtime_next_var)
         saved_variables = self.variables
+        param_kinds = self._function_param_kinds(function)
         self.variables = {}
         self.runtime_var_offsets = {}
         self.runtime_var_types = {}
-        self.runtime_next_var = len(function.params)
-        for index, param in enumerate(function.params):
-            self.runtime_var_offsets[param] = 16 + 8 * index
-
-        num_vars = len(function.params) + self._count_let_declarations(function.body)
-        frame_size = (16 + 8 * num_vars + 15) & ~15
+        env = {}
+        slot = 0
+        param_offsets = []
+        for param, kind in zip(function.params, param_kinds):
+            offset = 16 + 8 * slot
+            self.runtime_var_offsets[param] = offset
+            self.runtime_var_types[param] = kind
+            env[param] = kind
+            param_offsets.append((param, kind, offset))
+            slot += self._width(kind)
+        self.runtime_next_var = slot
+        self._plan_function_body(function.body, env)
+        frame_size = (16 + 8 * self.runtime_next_var + 15) & ~15
         exit_label = f'L_function_return_{self.label}'
         self.label += 1
         saved_return_label = self.return_label
@@ -506,8 +538,13 @@ class CodeGen:
         lines = [f'_serenity_{function.name}:']
         lines.append(f'    stp x29, x30, [sp, #-{frame_size}]!')
         lines.append('    mov x29, sp')
-        for index, param in enumerate(function.params):
-            lines.append(f'    str x{index}, [x29, #{16 + 8 * index}]')
+        for param, kind, offset in param_offsets:
+            register = (offset - 16) // 8
+            if kind == 'string':
+                lines.append(f'    str x{register}, [x29, #{offset}]')
+                lines.append(f'    str x{register + 1}, [x29, #{offset + 8}]')
+            else:
+                lines.append(f'    str x{register}, [x29, #{offset}]')
         lines.extend(self._compile_runtime_statements(function.body))
         lines.append(f'{exit_label}:')
         lines.append(f'    ldp x29, x30, [sp], #{frame_size}')
@@ -518,31 +555,50 @@ class CodeGen:
         self.return_label = saved_return_label
         return lines
 
-    @staticmethod
-    def _count_let_declarations(statements):
-        count = 0
+    def _plan_function_body(self, statements, env):
+        """Pre-assign stack slots for every `let` in a user-function body.
+
+        Walks the body in exactly the order `_compile_runtime_statements`
+        allocates runtime variables so frame sizing always agrees with the
+        offsets used later.
+        """
         for statement in statements:
             if isinstance(statement, LetStmt):
-                count += 1
+                kind = self._static_kind(statement.initializer, env)
+                self.runtime_var_offsets[statement.name] = 16 + 8 * self.runtime_next_var
+                self.runtime_var_types[statement.name] = kind
+                env[statement.name] = kind
+                self.runtime_next_var += self._width(kind)
+            elif isinstance(statement, AssignStmt):
+                if statement.name in env:
+                    env[statement.name] = self._static_kind(statement.value, env)
             elif isinstance(statement, IfStmt):
-                count += CodeGen._count_let_declarations(statement.then_branch)
+                self._plan_function_body(statement.then_branch, env)
                 if isinstance(statement.else_branch, IfStmt):
-                    count += CodeGen._count_let_declarations([statement.else_branch])
+                    self._plan_function_body([statement.else_branch], env)
                 elif statement.else_branch is not None:
-                    count += CodeGen._count_let_declarations(statement.else_branch)
+                    self._plan_function_body(statement.else_branch, env)
             elif isinstance(statement, WhileStmt):
-                count += CodeGen._count_let_declarations(statement.body)
+                self._plan_function_body(statement.body, env)
             elif isinstance(statement, ForStmt):
-                count += 1
-                count += CodeGen._count_let_declarations(statement.body)
-        return count
+                if statement.initializer.name not in self.runtime_var_offsets:
+                    kind = self._static_kind(statement.initializer.initializer, env)
+                    self.runtime_var_offsets[statement.initializer.name] = 16 + 8 * self.runtime_next_var
+                    self.runtime_var_types[statement.initializer.name] = kind
+                    env[statement.initializer.name] = kind
+                    self.runtime_next_var += self._width(kind)
+                self._plan_function_body(statement.body, env)
 
     def _count_runtime_lets(self, statements):
         count = 0
         for statement in statements:
             if isinstance(statement, LetStmt):
                 if self._contains_runtime_value(statement.initializer):
-                    count += 1
+                    count += self._width(self._static_kind(statement.initializer, self._current_env()))
+            elif isinstance(statement, AssignStmt):
+                if (statement.name in self.variables
+                        and self._contains_runtime_value(statement.value)):
+                    count += self._width(self._static_kind(statement.value, self._current_env()))
             elif isinstance(statement, IfStmt):
                 count += self._count_runtime_lets(statement.then_branch)
                 if isinstance(statement.else_branch, IfStmt):
@@ -560,12 +616,18 @@ class CodeGen:
         lines = []
         for statement in statements:
             if isinstance(statement, LetStmt):
-                offset = 16 + 8 * self.runtime_next_var
-                self.runtime_var_offsets[statement.name] = offset
-                self.runtime_var_types[statement.name] = self._classify_runtime_type(statement.initializer)
-                self.runtime_next_var += 1
+                if statement.name not in self.runtime_var_offsets:
+                    kind = self._static_kind(statement.initializer, self._current_env())
+                    self.runtime_var_offsets[statement.name] = 16 + 8 * self.runtime_next_var
+                    self.runtime_var_types[statement.name] = kind
+                    self.runtime_next_var += self._width(kind)
                 lines.extend(self._compile_runtime_expression(statement.initializer))
-                lines.append(f'    str x0, [x29, #{offset}]')
+                lines.extend(self._store_runtime_var(statement.name))
+            elif isinstance(statement, AssignStmt):
+                if statement.name not in self.runtime_var_offsets:
+                    raise CompileError(f"undefined variable '{statement.name}'")
+                lines.extend(self._compile_runtime_expression(statement.value))
+                lines.extend(self._store_runtime_var(statement.name))
             elif isinstance(statement, IfStmt):
                 lines.extend(self._compile_runtime_if(statement))
             elif isinstance(statement, WhileStmt):
@@ -585,7 +647,7 @@ class CodeGen:
                 raise CompileError(f'cannot compile statement {statement!r} in user function')
         return lines
 
-    def _compile_runtime_expression(self, expression):
+    def _compile_runtime_expression(self, expression, env=None):
         if isinstance(expression, IntLiteral):
             return [f'    mov x0, #{expression.value}']
         if isinstance(expression, BoolLiteral):
@@ -593,35 +655,150 @@ class CodeGen:
         if isinstance(expression, NullLiteral):
             return ['    mov x0, #0']
         if isinstance(expression, StringLiteral):
-            raise CompileError('string values in user-defined functions are not yet supported')
+            label, size = self._new_string(expression.value)
+            return [f'    adrp x0, {label}@PAGE', f'    add x0, x0, {label}@PAGEOFF', f'    mov x1, #{size}']
         if isinstance(expression, Identifier):
             if expression.name in self.runtime_var_offsets:
+                if self.runtime_var_types.get(expression.name) == 'string':
+                    return self._load_runtime_var(expression.name)
                 return [f'    ldr x0, [x29, #{self.runtime_var_offsets[expression.name]}]']
             if expression.name in self.variables:
-                return self._compile_runtime_expression(self.variables[expression.name])
+                return self._compile_runtime_expression(self.variables[expression.name], env)
             raise CompileError(f"undefined variable '{expression.name}'")
         if isinstance(expression, Unary):
-            return self._compile_runtime_unary(expression)
+            return self._compile_runtime_unary(expression, env)
         if isinstance(expression, Binary):
-            return self._compile_runtime_binary(expression)
+            return self._compile_runtime_binary(expression, env)
         if isinstance(expression, Conditional):
-            return self._compile_runtime_conditional(expression)
+            return self._compile_runtime_conditional(expression, env)
         if isinstance(expression, Call):
-            return self._compile_runtime_call(expression)
+            return self._compile_runtime_call(expression, env)
         raise CompileError(f'cannot compile expression {expression!r}')
 
-    def _compile_runtime_unary(self, expression):
-        lines = self._compile_runtime_expression(expression.operand)
+    def _store_runtime_var(self, name):
+        if self.runtime_var_types.get(name) == 'string':
+            offset = self.runtime_var_offsets[name]
+            return [f'    str x0, [x29, #{offset}]', f'    str x1, [x29, #{offset + 8}]']
+        return [f'    str x0, [x29, #{self.runtime_var_offsets[name]}]']
+
+    def _load_runtime_var(self, name):
+        offset = self.runtime_var_offsets[name]
+        return [f'    ldr x0, [x29, #{offset}]', f'    ldr x1, [x29, #{offset + 8}]']
+
+    def _current_env(self):
+        env = dict(self.runtime_var_types)
+        for name in self.variables:
+            if name not in env:
+                env[name] = self._static_kind(self.variables[name], env, {name})
+        return env
+
+    def _static_kind(self, expression, env=None, seen=None):
+        """Best-effort static kind of an expression's runtime value.
+
+        Kinds are 'int', 'bool', 'string', 'null', or 'unknown'. Strings
+        occupy two registers/slots; every other value occupies one.
+        """
+        env = {} if env is None else env
+        if isinstance(expression, IntLiteral):
+            return 'int'
+        if isinstance(expression, BoolLiteral):
+            return 'bool'
+        if isinstance(expression, StringLiteral):
+            return 'string'
+        if isinstance(expression, NullLiteral):
+            return 'null'
+        if isinstance(expression, Identifier):
+            if expression.name in env:
+                kind = env[expression.name]
+                return kind if kind in ('int', 'bool', 'string', 'null') else 'unknown'
+            if expression.name in self.runtime_var_types:
+                return self.runtime_var_types[expression.name]
+            if expression.name in self.variables:
+                seen = set() if seen is None else seen
+                if expression.name in seen:
+                    return 'unknown'
+                seen.add(expression.name)
+                return self._static_kind(self.variables[expression.name], env, seen)
+            return 'unknown'
+        if isinstance(expression, Unary):
+            if expression.operator == '!':
+                return 'bool'
+            return self._static_kind(expression.operand, env, seen)
+        if isinstance(expression, Binary):
+            if expression.operator in ('==', '!=', '<', '<=', '>', '>=', '&&', '||'):
+                return 'bool'
+            if expression.operator == '+':
+                if (self._static_kind(expression.left, env, seen) == 'string'
+                        or self._static_kind(expression.right, env, seen) == 'string'):
+                    return 'string'
+                return 'int'
+            return 'int'
+        if isinstance(expression, Conditional):
+            then_kind = self._static_kind(expression.if_true, env, seen)
+            else_kind = self._static_kind(expression.if_false, env, seen)
+            return then_kind if then_kind == else_kind else 'unknown'
+        if isinstance(expression, Call):
+            if expression.callee in STRING_PRODUCING_FUNCTIONS:
+                return 'string'
+            if expression.callee in NUMERIC_FUNCTIONS:
+                return 'int'
+            if expression.callee == 'eval':
+                return self._static_kind(expression.arguments[0], env, seen) if expression.arguments else 'unknown'
+            if expression.callee in self.user_functions:
+                return self._function_return_kind(self.user_functions[expression.callee])
+            return 'null'
+        return 'unknown'
+
+    def _compile_runtime_unary(self, expression, env=None):
+        lines = self._compile_runtime_expression(expression.operand, env)
         if expression.operator == '-':
             return lines + ['    neg x0, x0']
         if expression.operator == '!':
             return lines + ['    cmp x0, #0', '    cset w0, eq']
         raise CompileError(f'unsupported unary operator {expression.operator!r}')
 
-    def _compile_runtime_binary(self, expression):
-        lines = self._compile_runtime_expression(expression.left)
+    @staticmethod
+    def _kind_name(kind):
+        return {'int': 'integer', 'bool': 'bool', 'string': 'string',
+                'null': 'null', 'unknown': 'value'}.get(kind, 'value')
+
+    def _compile_runtime_binary(self, expression, env=None):
+        operator = expression.operator
+        left_kind = self._static_kind(expression.left, env)
+        right_kind = self._static_kind(expression.right, env)
+        if operator == '+':
+            if left_kind == 'string' or right_kind == 'string':
+                if left_kind != 'string' or right_kind != 'string':
+                    if left_kind == 'null' or right_kind == 'null':
+                        raise CompileError('cannot concatenate a string with null')
+                    raise CompileError('cannot concatenate a string with a non-string')
+                lines = self._compile_runtime_expression(expression.left, env)
+                lines.append('    stp x0, x1, [sp, #-16]!')
+                lines.extend(self._compile_runtime_expression(expression.right, env))
+                lines.extend(['    ldp x2, x3, [sp], #16', '    bl _serenity_concat'])
+                return lines
+            return self._compile_runtime_numeric_binary(expression, env)
+        if operator in ('==', '!=', '<', '<=', '>', '>='):
+            if left_kind == 'string' or right_kind == 'string':
+                if left_kind == 'string' and right_kind == 'string':
+                    lines = self._compile_runtime_expression(expression.right, env)
+                    lines.append('    stp x0, x1, [sp, #-16]!')
+                    lines.extend(self._compile_runtime_expression(expression.left, env))
+                    lines.extend(['    ldp x2, x3, [sp], #16', '    bl _serenity_str_cmp'])
+                    condition = {'==': 'eq', '!=': 'ne', '<': 'lt', '<=': 'le', '>': 'gt', '>=': 'ge'}[operator]
+                    return lines + [f'    cmp x0, #0', f'    cset w0, {condition}']
+                if operator in ('==', '!='):
+                    return [f'    mov x0, #{0 if operator == "==" else 1}']
+                if left_kind == 'string':
+                    raise CompileError(f'cannot compare string with {self._kind_name(right_kind)}')
+                raise CompileError(f'cannot compare {self._kind_name(left_kind)} with string')
+            return self._compile_runtime_numeric_binary(expression, env)
+        return self._compile_runtime_numeric_binary(expression, env)
+
+    def _compile_runtime_numeric_binary(self, expression, env=None):
+        lines = self._compile_runtime_expression(expression.left, env)
         lines.append('    str x0, [sp, #-16]!')
-        lines.extend(self._compile_runtime_expression(expression.right))
+        lines.extend(self._compile_runtime_expression(expression.right, env))
         lines.append('    ldr x1, [sp], #16')
         operator = expression.operator
         if operator in ('+', '-', '*', '/'):
@@ -654,15 +831,21 @@ class CodeGen:
             ]
         raise CompileError(f'unsupported operator {operator!r} in runtime expression')
 
-    def _compile_runtime_conditional(self, expression):
+    def _compile_runtime_condition(self, expression, env=None):
+        lines = self._compile_runtime_expression(expression, env)
+        if self._static_kind(expression, env) == 'string':
+            lines.append('    mov x0, x1')
+        return lines
+
+    def _compile_runtime_conditional(self, expression, env=None):
         false_label = f'L_cond_false_{self.label}'
         end_label = f'L_cond_end_{self.label}'
         self.label += 1
-        lines = self._compile_runtime_expression(expression.condition)
+        lines = self._compile_runtime_condition(expression.condition, env)
         lines.extend(['    cmp x0, #0', f'    b.eq {false_label}'])
-        lines.extend(self._compile_runtime_expression(expression.if_true))
+        lines.extend(self._compile_runtime_expression(expression.if_true, env))
         lines.extend([f'    b {end_label}', f'{false_label}:'])
-        lines.extend(self._compile_runtime_expression(expression.if_false))
+        lines.extend(self._compile_runtime_expression(expression.if_false, env))
         lines.append(f'{end_label}:')
         return lines
 
@@ -670,7 +853,7 @@ class CodeGen:
         false_label = f'L_if_false_{self.label}'
         end_label = f'L_if_end_{self.label}'
         self.label += 1
-        lines = self._compile_runtime_expression(statement.condition)
+        lines = self._compile_runtime_condition(statement.condition)
         lines.extend(['    cmp x0, #0', f'    b.eq {false_label}'])
         lines.extend(self._compile_runtime_statements(statement.then_branch))
         lines.append(f'    b {end_label}')
@@ -688,7 +871,7 @@ class CodeGen:
         end_label = f'L_while_end_{self.label}'
         self.label += 1
         lines = [f'{start_label}:']
-        lines.extend(self._compile_runtime_expression(statement.condition))
+        lines.extend(self._compile_runtime_condition(statement.condition))
         lines.extend(['    cmp x0, #0', f'    b.eq {end_label}'])
         lines.extend(self._compile_runtime_statements(statement.body))
         lines.extend([f'    b {start_label}', f'{end_label}:'])
@@ -697,17 +880,18 @@ class CodeGen:
     def _compile_runtime_for(self, statement):
         lines = []
         if isinstance(statement.initializer, LetStmt):
-            offset = 16 + 8 * self.runtime_next_var
-            self.runtime_var_offsets[statement.initializer.name] = offset
-            self.runtime_var_types[statement.initializer.name] = self._classify_runtime_type(statement.initializer.initializer)
-            self.runtime_next_var += 1
+            if statement.initializer.name not in self.runtime_var_offsets:
+                kind = self._static_kind(statement.initializer.initializer, self._current_env())
+                self.runtime_var_offsets[statement.initializer.name] = 16 + 8 * self.runtime_next_var
+                self.runtime_var_types[statement.initializer.name] = kind
+                self.runtime_next_var += self._width(kind)
             lines.extend(self._compile_runtime_expression(statement.initializer.initializer))
-            lines.append(f'    str x0, [x29, #{offset}]')
+            lines.extend(self._store_runtime_var(statement.initializer.name))
         start_label = f'L_for_start_{self.label}'
         end_label = f'L_for_end_{self.label}'
         self.label += 1
         lines.append(f'{start_label}:')
-        lines.extend(self._compile_runtime_expression(statement.condition))
+        lines.extend(self._compile_runtime_condition(statement.condition))
         lines.extend(['    cmp x0, #0', f'    b.eq {end_label}'])
         lines.extend(self._compile_runtime_statements(statement.body))
         if isinstance(statement.increment, IncrementStmt):
@@ -725,55 +909,307 @@ class CodeGen:
             f'    str x0, [x29, #{offset}]',
         ]
 
-    def _compile_runtime_call(self, expression):
+    def _compile_runtime_call(self, expression, env=None):
         callee = expression.callee
         arguments = expression.arguments
         if callee in ('print', 'println'):
-            return self._compile_runtime_print(callee, arguments)
+            return self._compile_runtime_print(callee, arguments, env)
         if callee == 'eval':
             if len(arguments) != 1:
                 raise CompileError('eval expects one argument')
-            return self._compile_runtime_expression(arguments[0])
+            return self._compile_runtime_expression(arguments[0], env)
         if callee == 'exit':
             if len(arguments) == 0:
                 return ['    mov x0, #0', '    bl _exit']
             if len(arguments) != 1:
                 raise CompileError('exit expects 0 or 1 argument')
-            return [*self._compile_runtime_expression(arguments[0]), '    bl _exit']
+            return [*self._compile_runtime_expression(arguments[0], env), '    bl _exit']
         if callee in ALL_BUILTIN_FUNCTIONS:
-            try:
+            if not self._contains_runtime_value(expression):
                 value = self._constant_value(expression)
-            except CompileError:
-                raise CompileError(f"builtin '{callee}' is not yet supported inside user-defined functions")
-            if isinstance(value, bool):
-                return [f'    mov x0, #{1 if value else 0}']
-            if isinstance(value, int) and not isinstance(value, bool):
-                return [f'    mov x0, #{value}']
-            raise CompileError(f"call '{callee}' produces a non-numeric value")
+                if isinstance(value, bool):
+                    return [f'    mov x0, #{1 if value else 0}']
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return [f'    mov x0, #{value}']
+                raise CompileError(f"call '{callee}' produces a non-numeric value")
+            return self._compile_runtime_string_builtin(callee, arguments, env)
         if callee not in self.user_functions:
             raise CompileError(f"undefined function '{callee}'")
         function = self.user_functions[callee]
         if len(arguments) != len(function.params):
             raise CompileError(f'{callee} expects {len(function.params)} arguments, got {len(arguments)}')
-        if len(arguments) > 8:
+        param_kinds = self._function_param_kinds(function)
+        starts = []
+        total = 0
+        for argument, kind in zip(arguments, param_kinds):
+            arg_kind = self._static_kind(argument, env)
+            if kind == 'string':
+                if arg_kind != 'string' and arg_kind != 'unknown':
+                    raise CompileError(f"'{callee}' expects a string, got {self._kind_name(arg_kind)}")
+            elif arg_kind == 'string':
+                raise CompileError(f"cannot pass a string to non-string parameter of '{callee}'")
+            starts.append(total)
+            total += self._width(kind)
+        if total > 8:
             raise CompileError(f'too many arguments ({len(arguments)}), maximum is 8')
         lines = []
-        for argument in reversed(arguments):
-            lines.extend(self._compile_runtime_expression(argument))
-            lines.append('    str x0, [sp, #-16]!')
-        for index in range(len(arguments)):
+        for argument, kind in reversed(list(zip(arguments, param_kinds))):
+            lines.extend(self._compile_runtime_expression(argument, env))
+            if kind == 'string':
+                lines.append('    str x1, [sp, #-16]!')
+                lines.append('    str x0, [sp, #-16]!')
+            else:
+                lines.append('    str x0, [sp, #-16]!')
+        for index in range(total):
             lines.append(f'    ldr x{index}, [sp], #16')
         lines.append(f'    bl _serenity_{callee}')
         return lines
 
-    def _compile_runtime_print(self, callee, arguments):
+    def _compile_runtime_string_builtin(self, callee, arguments, env=None):
+        """Compile string builtins on values only known at runtime."""
+        function, arity = ALL_BUILTIN_FUNCTIONS[callee]
+        if len(arguments) != arity:
+            raise CompileError(f'{callee} expects {arity} argument(s), got {len(arguments)}')
+        if self._static_kind(arguments[0], env) != 'string':
+            raise CompileError(f"builtin '{callee}' is not yet supported inside user-defined functions")
+        if callee == 'length':
+            return [*self._compile_runtime_expression(arguments[0], env), '    mov x0, x1']
+        if callee == 'charAt':
+            lines = self._compile_runtime_expression(arguments[0], env)
+            lines.append('    stp x0, x1, [sp, #-16]!')
+            lines.extend(self._compile_runtime_expression(arguments[1], env))
+            lines.append('    mov x2, x0')
+            lines.extend(['    ldp x0, x1, [sp], #16', '    bl _serenity_char_at'])
+            return lines
+        if callee == 'substring':
+            lines = self._compile_runtime_expression(arguments[0], env)
+            lines.append('    stp x0, x1, [sp, #-16]!')
+            lines.extend(self._compile_runtime_expression(arguments[1], env))
+            lines.append('    str x0, [sp, #-16]!')
+            lines.extend(self._compile_runtime_expression(arguments[2], env))
+            lines.append('    mov x3, x0')
+            lines.extend(['    ldr x2, [sp], #16', '    ldp x0, x1, [sp], #16', '    bl _serenity_substring'])
+            return lines
+        helper = {'toUpper': '_serenity_to_upper', 'toLower': '_serenity_to_lower',
+                  'trim': '_serenity_trim'}[callee]
+        return [*self._compile_runtime_expression(arguments[0], env), f'    bl {helper}']
+
+    def _compile_runtime_print(self, callee, arguments, env=None):
         if len(arguments) != 1:
             raise CompileError(f'{callee} expects one argument')
-        lines = self._compile_runtime_expression(arguments[0])
-        lines.append('    bl _serenity_print_int')
+        argument = arguments[0]
+        kind = self._static_kind(argument, env)
+        lines = self._compile_runtime_expression(argument, env)
+        if kind == 'string':
+            lines.extend(['    mov x2, x1', '    mov x1, x0', '    mov x0, #1', '    bl _write'])
+        else:
+            helper = '_serenity_print_bool' if kind == 'bool' else '_serenity_print_int'
+            lines.append(f'    bl {helper}')
         if callee == 'println':
             lines.extend(self._write_lines('\n'))
         return lines
+
+    @staticmethod
+    def _width(kind):
+        return 2 if kind == 'string' else 1
+
+    def _function_param_kinds(self, function):
+        """Classify each parameter as 'string' or 'word' via a fixed point.
+
+        A parameter becomes a string when it is used in any position that
+        requires a string value: concatenation or comparison against a known
+        string, as the subject of a string builtin, or as a string argument to
+        another user-defined function.
+        """
+        if function.name in self._param_kind_cache:
+            return self._param_kind_cache[function.name]
+        self._param_kind_cache[function.name] = ['word'] * len(function.params)
+        kinds = ['word'] * len(function.params)
+        while True:
+            env = dict(zip(function.params, kinds))
+            changed = False
+            for index, param in enumerate(function.params):
+                if kinds[index] == 'string':
+                    continue
+                if self._body_uses_as_string(function.body, param, env):
+                    kinds[index] = 'string'
+                    env[param] = 'string'
+                    changed = True
+            self._param_kind_cache[function.name] = kinds
+            if not changed:
+                break
+        return kinds
+
+    def _body_uses_as_string(self, statements, name, env):
+        for statement in statements:
+            if isinstance(statement, LetStmt) and self._expr_uses_as_string(statement.initializer, name, env):
+                return True
+            if isinstance(statement, AssignStmt) and self._expr_uses_as_string(statement.value, name, env):
+                return True
+            if isinstance(statement, ReturnStmt) and self._expr_uses_as_string(statement.expression, name, env):
+                return True
+            if isinstance(statement, ExprStmt) and self._expr_uses_as_string(statement.expression, name, env):
+                return True
+            if isinstance(statement, IfStmt):
+                if self._expr_uses_as_string(statement.condition, name, env):
+                    return True
+                if self._body_uses_as_string(statement.then_branch, name, env):
+                    return True
+                if isinstance(statement.else_branch, IfStmt):
+                    if self._body_uses_as_string([statement.else_branch], name, env):
+                        return True
+                elif statement.else_branch is not None and self._body_uses_as_string(statement.else_branch, name, env):
+                    return True
+            if isinstance(statement, WhileStmt):
+                if self._expr_uses_as_string(statement.condition, name, env):
+                    return True
+                if self._body_uses_as_string(statement.body, name, env):
+                    return True
+            if isinstance(statement, ForStmt):
+                if self._expr_uses_as_string(statement.initializer.initializer, name, env):
+                    return True
+                if self._expr_uses_as_string(statement.condition, name, env):
+                    return True
+                if self._body_uses_as_string(statement.body, name, env):
+                    return True
+        return False
+
+    def _expr_uses_as_string(self, expression, name, env):
+        """True when `name` appears inside `expression` in a string position."""
+        if isinstance(expression, Identifier):
+            return False
+        if isinstance(expression, (IntLiteral, StringLiteral, BoolLiteral, NullLiteral)):
+            return False
+        if isinstance(expression, Unary):
+            return self._expr_uses_as_string(expression.operand, name, env)
+        if isinstance(expression, Binary):
+            if expression.operator == '+':
+                if self._contains(expression.left, name) and self._is_string_safe(expression.right, env):
+                    return True
+                if self._contains(expression.right, name) and self._is_string_safe(expression.left, env):
+                    return True
+                return False
+            if expression.operator in ('==', '!=', '<', '<=', '>', '>='):
+                if self._contains(expression.left, name) and self._is_string_safe(expression.right, env):
+                    return True
+                if self._contains(expression.right, name) and self._is_string_safe(expression.left, env):
+                    return True
+                return False
+            return False
+        if isinstance(expression, Conditional):
+            if self._contains(expression.if_true, name) and self._is_string_safe(expression.if_false, env):
+                return True
+            if self._contains(expression.if_false, name) and self._is_string_safe(expression.if_true, env):
+                return True
+            return self._expr_uses_as_string(expression.condition, name, env)
+        if isinstance(expression, Call):
+            if expression.callee in ALL_BUILTIN_FUNCTIONS:
+                if not expression.arguments:
+                    return False
+                if self._contains(expression.arguments[0], name):
+                    return True
+                if expression.callee in ('contains', 'indexOf') and len(expression.arguments) > 1:
+                    return self._contains(expression.arguments[1], name)
+                return False
+            if expression.callee in self.user_functions:
+                function = self.user_functions[expression.callee]
+                kinds = self._function_param_kinds(function)
+                for argument, kind in zip(expression.arguments, kinds):
+                    if kind == 'string' and self._contains(argument, name):
+                        return True
+            return False
+        return False
+
+    def _is_string_safe(self, expression, env):
+        """Statically known to be a string, independent of `name`."""
+        if isinstance(expression, StringLiteral):
+            return True
+        if isinstance(expression, Identifier):
+            return env.get(expression.name) == 'string'
+        if isinstance(expression, (IntLiteral, BoolLiteral, NullLiteral)):
+            return False
+        if isinstance(expression, Unary):
+            return self._is_string_safe(expression.operand, env)
+        if isinstance(expression, Binary):
+            return (expression.operator == '+'
+                    and (self._is_string_safe(expression.left, env) or self._is_string_safe(expression.right, env)))
+        if isinstance(expression, Conditional):
+            return self._is_string_safe(expression.if_true, env) and self._is_string_safe(expression.if_false, env)
+        if isinstance(expression, Call):
+            return expression.callee in STRING_PRODUCING_FUNCTIONS
+        return False
+
+    @staticmethod
+    def _contains(expression, name):
+        if isinstance(expression, Identifier):
+            return expression.name == name
+        if isinstance(expression, (IntLiteral, StringLiteral, BoolLiteral, NullLiteral)):
+            return False
+        if isinstance(expression, Unary):
+            return CodeGen._contains(expression.operand, name)
+        if isinstance(expression, Binary):
+            return CodeGen._contains(expression.left, name) or CodeGen._contains(expression.right, name)
+        if isinstance(expression, Conditional):
+            return (CodeGen._contains(expression.condition, name)
+                    or CodeGen._contains(expression.if_true, name)
+                    or CodeGen._contains(expression.if_false, name))
+        if isinstance(expression, Call):
+            return any(CodeGen._contains(argument, name) for argument in expression.arguments)
+        return False
+
+    def _function_return_kind(self, function):
+        """Static kind ('string', 'bool', 'int', ...) of a function's result."""
+        if function.name in self._return_kind_cache:
+            return self._return_kind_cache[function.name]
+        self._return_kind_cache[function.name] = 'unknown'
+        env = dict(zip(function.params, ['string' if k == 'string' else 'word' for k in self._function_param_kinds(function)]))
+        _, final = self._analyze_function_types(function.body, env)
+        self._return_kind_cache[function.name] = final
+        return final
+
+    def _analyze_function_types(self, statements, env):
+        """Walk statements mirroring the runtime allocator's kinds, returning
+        (let slot count, kind of the final value)."""
+        slots = 0
+        final = None
+        for statement in statements:
+            if isinstance(statement, LetStmt):
+                kind = self._static_kind(statement.initializer, env)
+                env[statement.name] = kind
+                slots += self._width(kind)
+            elif isinstance(statement, AssignStmt):
+                if statement.name in env:
+                    env[statement.name] = self._static_kind(statement.value, env)
+            elif isinstance(statement, ExprStmt):
+                final = self._static_kind(statement.expression, env)
+            elif isinstance(statement, ReturnStmt):
+                final = self._static_kind(statement.expression, env)
+            elif isinstance(statement, IfStmt):
+                then_slots, then_final = self._analyze_function_types(list(statement.then_branch), env.copy())
+                slots += then_slots
+                if isinstance(statement.else_branch, IfStmt):
+                    else_slots, else_final = self._analyze_function_types([statement.else_branch], env.copy())
+                elif statement.else_branch is not None:
+                    else_slots, else_final = self._analyze_function_types(list(statement.else_branch), env.copy())
+                else:
+                    else_slots, else_final = 0, None
+                slots += else_slots
+                if then_final is not None and then_final == else_final:
+                    final = then_final
+            elif isinstance(statement, WhileStmt):
+                body_slots, body_final = self._analyze_function_types(list(statement.body), env.copy())
+                slots += body_slots
+                if final is None:
+                    final = body_final
+            elif isinstance(statement, ForStmt):
+                kind = self._static_kind(statement.initializer.initializer, env)
+                slots += self._width(kind)
+                env[statement.initializer.name] = kind
+                body_slots, body_final = self._analyze_function_types(list(statement.body), env.copy())
+                slots += body_slots
+                if final is None:
+                    final = body_final
+        return slots, final
 
     def _validate_initializer(self, expression):
         """Keep compiled `let` scope identical to the interpreter's scope."""
@@ -860,36 +1296,6 @@ class CodeGen:
             return self._is_bool_expression(expression.if_true) and self._is_bool_expression(expression.if_false)
         return False
 
-    def _classify_runtime_type(self, expression):
-        """Best-effort type of a runtime value: 'bool', 'int', or 'unknown'."""
-        if isinstance(expression, BoolLiteral):
-            return 'bool'
-        if isinstance(expression, IntLiteral):
-            return 'int'
-        if isinstance(expression, Identifier):
-            if expression.name in self.runtime_var_types:
-                return self.runtime_var_types[expression.name]
-            if expression.name in self.variables:
-                return self._classify_runtime_type(self.variables[expression.name])
-            return 'unknown'
-        if isinstance(expression, Unary):
-            if expression.operator == '!':
-                return 'bool'
-            return self._classify_runtime_type(expression.operand)
-        if isinstance(expression, Binary):
-            if expression.operator in ('==', '!=', '<', '<=', '>', '>=', '&&', '||'):
-                return 'bool'
-            return 'int'
-        if isinstance(expression, Conditional):
-            if_true = self._classify_runtime_type(expression.if_true)
-            if_false = self._classify_runtime_type(expression.if_false)
-            if if_true == if_false:
-                return if_true
-            return 'unknown'
-        if isinstance(expression, Call) and expression.callee in self.user_functions:
-            return 'bool' if self._function_returns_bool(self.user_functions[expression.callee]) else 'unknown'
-        return 'unknown'
-
     def _function_returns_bool(self, function):
         return self._statements_return_bool(function.body)
 
@@ -915,9 +1321,13 @@ class CodeGen:
         return False
 
     def _runtime_print(self, callee, argument, suffix):
-        helper = '_serenity_print_bool' if self._is_bool_expression(argument) else '_serenity_print_int'
+        kind = self._static_kind(argument)
         lines = self._expression(argument)
-        lines.append(f'    bl {helper}')
+        if kind == 'string':
+            lines.extend(['    mov x2, x1', '    mov x1, x0', '    mov x0, #1', '    bl _write'])
+        else:
+            helper = '_serenity_print_bool' if kind == 'bool' else '_serenity_print_int'
+            lines.append(f'    bl {helper}')
         if suffix:
             lines.extend(self._write_lines(suffix))
         return lines

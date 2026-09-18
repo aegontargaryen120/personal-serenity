@@ -279,6 +279,94 @@ class StringLibraryTests(unittest.TestCase):
         ), '7\nX!\n2024\n')
 
 
+def _functions(*functions):
+    return '\n'.join(functions) + '\n'
+
+
+class StringFunctionTests(unittest.TestCase):
+    def test_function_returns_string_literal(self):
+        _Harness.both_agree(self, _functions(
+            'func answer() => ( return "yes"; )',
+            _program('println(answer());'),
+        ), 'yes\n')
+
+    def test_println_inside_function(self):
+        _Harness.both_agree(self, _functions(
+            'func log() => ( println("inside function"); )',
+            _program('log();'),
+        ), 'inside function\n')
+
+    def test_concat_string_parameter(self):
+        _Harness.both_agree(self, _functions(
+            'func greet(name) => ( return "Hello, " + name + "!"; )',
+            _program('println(greet("Serenity"));'),
+        ), 'Hello, Serenity!\n')
+
+    def test_string_local_variable(self):
+        _Harness.both_agree(self, _functions(
+            'func shout(s) => ( let loud = toUpper(s); return loud + "!"; )',
+            _program('println(shout("hi"));'),
+        ), 'HI!\n')
+
+    def test_length_inside_function(self):
+        _Harness.both_agree(self, _functions(
+            'func slen(s) => ( return length(s); )',
+            _program('println(slen("abcd"));'),
+        ), '4\n')
+
+    def test_conditional_string_return(self):
+        _Harness.both_agree(self, _functions(
+            'func pick(n) => ( return n > 0 ? "positive" : "negative"; )',
+            _program('println(pick(1));', 'println(pick(-1));'),
+        ), 'positive\nnegative\n')
+
+    def test_string_returned_from_loop(self):
+        _Harness.both_agree(self, _functions(
+            'func repeat(n) => (',
+            '    let s = "";',
+            '    let i = 0;',
+            '    while (i < n) => { s = s + "a"; i++; }',
+            '    return s;',
+            ')',
+            _program('println(repeat(3));'),
+        ), 'aaa\n')
+
+    def test_composed_string_builtins(self):
+        _Harness.both_agree(self, _functions(
+            'func transform(s) => ( return toUpper(substring(s, 0, 2)); )',
+            _program('println(transform("hello"));'),
+        ), 'HE\n')
+
+    def test_equality_on_string_parameter(self):
+        _Harness.both_agree(self, _functions(
+            'func isHi(x) => ( return x == "hi"; )',
+            _program('println(isHi("hi"));', 'println(isHi("ho"));'),
+        ), 'true\nfalse\n')
+
+    def test_trim_result_compared_in_function(self):
+        _Harness.both_agree(self, _functions(
+            'func isTrimmed(s) => ( return trim(s) == "x"; )',
+            _program('println(isTrimmed("  x  "));'),
+        ), 'true\n')
+
+    def test_multiple_string_arguments(self):
+        _Harness.both_agree(self, _functions(
+            'func combine(a, b, c) => ( return a + "|" + b + "|" + c; )',
+            _program('println(combine("x", "y", "z"));'),
+        ), 'x|y|z\n')
+
+    def test_string_passed_to_ambiguous_parameter(self):
+        """`a + b` on two parameters is treated as numeric by the compiler, so
+        passing strings is rejected there (a static-typing limitation), while
+        the dynamically-typed interpreter concatenates them happily."""
+        source = _functions(
+            'func join(a, b) => ( return a + b; )',
+            _program('println(join("x", "y"));'),
+        )
+        self.assertEqual(_Harness.interpret(source), 'xy\n')
+        _Harness.assert_compile_error(source, 'cannot pass a string to non-string parameter')
+
+
 class EscapedStringTests(unittest.TestCase):
     def test_escapes_in_strings(self):
         _Harness.both_agree(self, _program(

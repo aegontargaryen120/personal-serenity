@@ -311,6 +311,66 @@ class FunctionErrorTests(unittest.TestCase):
         _Harness.assert_compile_error(source, "undefined variable 'missing'")
 
 
+class AssignmentTests(unittest.TestCase):
+    def test_reassign_variable(self):
+        _Harness.both_agree(self, _program(
+            _main('let x = 1;', 'x = x + 2;', 'x = x * 3;', 'println(x);'),
+        ), '9\n')
+
+    def test_reassign_uses_previous_value(self):
+        _Harness.both_agree(self, _program(
+            _main('let total = 10;', 'total = total - 3;', 'total = total / 2;', 'println(total);'),
+        ), '3\n')
+
+    def test_reassign_in_function_while(self):
+        _Harness.both_agree(self, _program(
+            'func sumTo(n) => (',
+            '    let total = 0;',
+            '    let i = 1;',
+            '    while (i <= n) => { total = total + i; i++; }',
+            '    total;',
+            ')',
+            _main('println(sumTo(5));'),
+        ), '15\n')
+
+    def test_factorial_reassignment(self):
+        _Harness.both_agree(self, _program(
+            'func factorial(x) => (',
+            '    let result = 1;',
+            '    for (let i = 1; i <= x; i++) => { result = result * i; }',
+            '    return result;',
+            ')',
+            _main('println(factorial(5));'),
+        ), '120\n')
+
+    def test_reassign_parameter(self):
+        _Harness.both_agree(self, _program(
+            'func inc(x) => ( x = x + 10; x; )',
+            _main('println(inc(5));'),
+        ), '15\n')
+
+    def test_reassign_bool_variable(self):
+        _Harness.both_agree(self, _program(
+            _main('let flag = 1 < 2;', 'flag = 3 > 4;', 'println(flag);',
+                  'flag = 2 == 2;', 'println(flag);'),
+        ), 'false\ntrue\n')
+
+    def test_reassign_string_variable(self):
+        _Harness.both_agree(self, _program(
+            _main('let s = "a";', 's = s + "b" + "c";', 'println(s);'),
+        ), 'abc\n')
+
+    def test_reassign_propagates_from_block(self):
+        _Harness.both_agree(self, _program(
+            _main('let x = 1;', 'if (true) => { x = x + 1; }', 'println(x);'),
+        ), '2\n')
+
+    def test_reassign_undefined_variable(self):
+        source = _main('y = 3;')
+        _Harness.assert_interpret_raises(source, "undefined variable 'y'")
+        _Harness.assert_compile_error(source, "undefined variable 'y'")
+
+
 class ReturnStatementTests(unittest.TestCase):
     def test_explicit_return_value(self):
         _Harness.both_agree(self, _program(

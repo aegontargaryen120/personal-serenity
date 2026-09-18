@@ -1,4 +1,4 @@
-from .ast_nodes import Program, Function, ExprStmt, LetStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call
+from .ast_nodes import Program, Function, ExprStmt, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call
 from .scanner import TokenType
 
 
@@ -100,6 +100,10 @@ class Parser:
             name = self._advance().lexeme
             self._advance()
             return IncrementStmt(name)
+        if self._check(TokenType.IDENTIFIER) and self._peek_next().type == TokenType.EQUAL:
+            name = self._advance().lexeme
+            self._advance()
+            return AssignStmt(name, self._expression())
         if self._match(TokenType.RETURN):
             return ReturnStmt(self._expression())
         return ExprStmt(self._expression())

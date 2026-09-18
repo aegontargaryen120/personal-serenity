@@ -79,13 +79,17 @@ class Evaluator:
             return signal.value
 
     def _execute_statements(self, statements, environment):
-        from .ast_nodes import LetStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt
+        from .ast_nodes import LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt
         result = None
         for statement in statements:
             if isinstance(statement, LetStmt):
                 if statement.name in environment:
                     raise RuntimeError(f"variable '{statement.name}' is already declared")
                 environment[statement.name] = self._evaluate(statement.initializer, environment)
+            elif isinstance(statement, AssignStmt):
+                if statement.name not in environment:
+                    raise RuntimeError(f"undefined variable '{statement.name}'")
+                environment[statement.name] = self._evaluate(statement.value, environment)
             elif isinstance(statement, IncrementStmt):
                 if statement.name not in environment:
                     raise RuntimeError(f"undefined variable '{statement.name}'")

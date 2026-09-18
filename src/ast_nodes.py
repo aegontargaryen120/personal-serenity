@@ -25,6 +25,12 @@ class LetStmt:
 
 
 @dataclass
+class AssignStmt:
+    name: str
+    value: object
+
+
+@dataclass
 class IfStmt:
     condition: object
     then_branch: list
