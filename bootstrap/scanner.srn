@@ -26,6 +26,7 @@
 //   32 QUESTION     33 COLON        34 EQUAL        35 IF
 //   36 ELSE         37 WHILE        38 FOR          39 PLUS_PLUS
 //   40 ARROW        41 COLON_EQUAL  42 RETURN       43 EOF
+//   44 DOT
 //
 // Expected usage:
 //   bootstrap/scanner.srn is inlined into a driver program (like the stdlib
@@ -300,8 +301,9 @@ func singleTok(c, line, col) => (
     else => { if (c == "?") => { return tok(32, c, line, col); }
     else => { if (c == ":") => { return tok(33, c, line, col); }
     else => { if (c == "=") => { return tok(34, c, line, col); }
+    else => { if (c == ".") => { return tok(44, c, line, col); }
     else => { return null; }
-    } } } } } } } } } } } } } } } }
+    } } } } } } } } } } } } } } } } }
 )
 
 func escapeOf(c) => (

@@ -6,6 +6,7 @@ through the interpreter, the same path a program takes via `serenity prog`.
 import io
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -313,6 +314,84 @@ class StdlibCombinationTests(unittest.TestCase):
             'println(gcd(length(s2), 2));',
             'println(firstOf(null, toUpper(substring(s2, 0, 2))));',
         ]), '1010\n00001010\n1010\ntrue\n2\n10\n')
+
+
+class SystemBuiltinTests(unittest.TestCase):
+    """`shellex` and the `file` metaprogramming builtins are host-backed: they
+    are available to any program (no %import required), like print and eval."""
+
+    def test_shellex_runs_and_returns_exit_code(self):
+        self.assertEqual(_Harness.run(statements=[
+            'let code = shellex("echo hi");',
+            'println(code);',
+        ]), 'hi\n0\n')
+
+    def test_shellex_reports_failing_exit_code(self):
+        self.assertEqual(_Harness.run(statements=[
+            'let code = shellex("exit 3");',
+            'println(code);',
+        ]), '3\n')
+
+    def test_shellex_requires_a_string(self):
+        with self.assertRaisesRegex(evaluator.RuntimeError, 'shellex expects a string command'):
+            _Harness.run(statements=[
+                'shellex(42);',
+            ])
+
+    def test_file_write_close_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'notes.txt')
+            self.assertEqual(_Harness.run(statements=[
+                f'let f = "{path}";',
+                'file(f);',
+                'f.write("hello world");',
+                'f.write(42);',
+                'f.close();',
+            ]), '')
+            with open(path) as handle:
+                self.assertEqual(handle.read(), 'hello world\n42\n')
+
+    def test_file_creates_missing_parent_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'build', 'out', 'notes.txt')
+            _Harness.run(statements=[
+                f'let f = "{path}";',
+                'file(f);',
+                'f.write("x");',
+                'f.close();',
+            ])
+            with open(path) as handle:
+                self.assertEqual(handle.read(), 'x\n')
+
+    def test_file_with_returned_handle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'gen.srn')
+            _Harness.run(statements=[
+                f'let f = file("{path}");',
+                'f.write("func main() => ( println(42); )");',
+                'f.close();',
+            ])
+            with open(path) as handle:
+                self.assertEqual(handle.read(), 'func main() => ( println(42); )\n')
+
+    def test_write_requires_a_file_handle(self):
+        with self.assertRaisesRegex(evaluator.RuntimeError, "'s.write' is only supported on file handles"):
+            _Harness.run(statements=[
+                'let s = "abc";',
+                's.write("x");',
+            ])
+
+    def test_method_on_undefined_variable(self):
+        with self.assertRaisesRegex(evaluator.RuntimeError, "undefined variable 'missing'"):
+            _Harness.run(statements=[
+                'missing.close();',
+            ])
+
+    def test_file_requires_a_string_path(self):
+        with self.assertRaisesRegex(evaluator.RuntimeError, 'file expects a string path'):
+            _Harness.run(statements=[
+                'file(42);',
+            ])
 
 
 if __name__ == '__main__':

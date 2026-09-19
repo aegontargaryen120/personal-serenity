@@ -48,6 +48,7 @@ class TokenType(Enum):
     COLON_EQUAL = auto()
     RETURN = auto()
     EOF = auto()
+    DOT = auto()
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ class Scanner:
         '^': TokenType.CARET, '{': TokenType.LBRACE, '}': TokenType.RBRACE,
         '[': TokenType.LBRACKET, ']': TokenType.RBRACKET,
         '?': TokenType.QUESTION, ':': TokenType.COLON, '=': TokenType.EQUAL,
+        '.': TokenType.DOT,
     }
 
     def __init__(self, source, filename='<source>'):

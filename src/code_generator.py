@@ -10,7 +10,7 @@ genuinely computed at runtime: string concatenation and the string library are
 emitted as calls to `_serenity_*` subroutines that malloc and build actual byte
 buffers when the program runs.
 """
-from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, ExprStmt, Function, ListLiteral
+from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, MethodCall, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, ExprStmt, Function, ListLiteral
 from .binary_ops import apply as apply_operator, OperationError
 from .string_builtins import (
     char_at, substring, to_upper, to_lower, trim, to_int,
@@ -64,6 +64,8 @@ STRING_SUBJECT_BUILTINS = {
 }
 
 ALL_BUILTIN_FUNCTIONS = {**STRING_PRODUCING_FUNCTIONS, **NUMERIC_FUNCTIONS, **LIST_FUNCTIONS}
+
+INTERPRETER_ONLY_FUNCTIONS = {'shellex', 'file'}
 
 
 class CodeGen:
@@ -673,6 +675,9 @@ class CodeGen:
         return lines
 
     def _compile_runtime_expression(self, expression, env=None):
+        if isinstance(expression, MethodCall):
+            raise CompileError(
+                f"method call '{expression.receiver}.{expression.method}' is only supported by the interpreter")
         if isinstance(expression, IntLiteral):
             return [f'    mov x0, #{expression.value}']
         if isinstance(expression, BoolLiteral):
@@ -948,6 +953,8 @@ class CodeGen:
     def _compile_runtime_call(self, expression, env=None):
         callee = expression.callee
         arguments = expression.arguments
+        if callee in INTERPRETER_ONLY_FUNCTIONS:
+            raise CompileError(f"'{callee}' is only supported by the interpreter")
         if callee in ('print', 'println'):
             return self._compile_runtime_print(callee, arguments, env)
         if callee == 'eval':
@@ -1253,6 +1260,8 @@ class CodeGen:
 
     def _validate_initializer(self, expression):
         """Keep compiled `let` scope identical to the interpreter's scope."""
+        if isinstance(expression, Call) and expression.callee in INTERPRETER_ONLY_FUNCTIONS:
+            raise CompileError(f"'{expression.callee}' is only supported by the interpreter")
         if isinstance(expression, Identifier):
             if expression.name in self.runtime_var_offsets:
                 return
@@ -1301,6 +1310,8 @@ class CodeGen:
 
     def _contains_runtime_value(self, expression):
         """True when the expression yields a value only known at runtime."""
+        if isinstance(expression, MethodCall):
+            return True
         if isinstance(expression, Identifier):
             return expression.name in self.runtime_var_offsets
         if isinstance(expression, ListLiteral):
@@ -1581,6 +1592,8 @@ class CodeGen:
                 raise CompileError(f"string variable '{expression.name}' cannot be used in a numeric expression")
             return self._expression(value)
         if isinstance(expression, Call):
+            if expression.callee in INTERPRETER_ONLY_FUNCTIONS:
+                raise CompileError(f"'{expression.callee}' is only supported by the interpreter")
             value = self._constant_value(expression)
             if isinstance(value, bool):
                 return [f'    mov x0, #{1 if value else 0}']

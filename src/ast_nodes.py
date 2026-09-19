@@ -113,5 +113,12 @@ class Call:
 
 
 @dataclass
+class MethodCall:
+    receiver: str
+    method: str
+    arguments: list
+
+
+@dataclass
 class ListLiteral:
     elements: list

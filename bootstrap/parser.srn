@@ -31,6 +31,7 @@
 //   Unary         ["Unary", operator, operand]
 //   Conditional   ["Conditional", condition, if_true, if_false]
 //   Call          ["Call", callee, [argument, ...]]
+//   MethodCall    ["MethodCall", receiver, method, [argument, ...]]
 //   ListLiteral   ["ListLiteral", [element, ...]]
 //
 // Errors cannot raise in Serenity: where the host parser raises ParseError
@@ -594,6 +595,25 @@ func pPrimary(s) => (
     if (pNode(mId)) => {
         let name = pTLex(pNode(mId));
         let st = pTail(mId);
+        let md = pTake(st, [44]);
+        if (pNode(md)) => {
+            let a = pRequire(pTail(md), 6, "expected method name after '.'");
+            if (pBad(a)) => { return a; }
+            let method = pTLex(pNode(a));
+            let b = pRequire(pTail(a), 9, "expected '(' after method name");
+            if (pBad(b)) => { return b; }
+            let st2 = pTail(b);
+            let args = [];
+            if (!pHas(st2, [10])) => {
+                let items = pItems(st2, 10);
+                if (pBad(items)) => { return items; }
+                args = pNode(items);
+                st2 = pTail(items);
+            }
+            let close = pRequire(st2, 10, "expected ')' after method arguments");
+            if (pBad(close)) => { return close; }
+            return [["MethodCall", name, method, args], pTail(close)];
+        }
         let mc = pTake(st, [9]);
         if (pNode(mc)) => {
             let st2 = pTail(mc);

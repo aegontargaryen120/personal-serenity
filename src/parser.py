@@ -1,4 +1,4 @@
-from .ast_nodes import Program, Function, ExprStmt, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, ListLiteral
+from .ast_nodes import Program, Function, ExprStmt, LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt, IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, MethodCall, ListLiteral
 from .scanner import TokenType
 
 
@@ -231,6 +231,17 @@ class Parser:
             return ListLiteral(elements)
         if self._match(TokenType.IDENTIFIER):
             name = self._previous().lexeme
+            if self._match(TokenType.DOT):
+                method = self._consume(TokenType.IDENTIFIER, "expected method name after '.'").lexeme
+                self._consume(TokenType.LPAREN, "expected '(' after method name")
+                args = []
+                if not self._check(TokenType.RPAREN):
+                    while True:
+                        args.append(self._expression())
+                        if not self._match(TokenType.COMMA):
+                            break
+                self._consume(TokenType.RPAREN, "expected ')' after method arguments")
+                return MethodCall(name, method, args)
             if self._match(TokenType.LPAREN):
                 args = []
                 if not self._check(TokenType.RPAREN):

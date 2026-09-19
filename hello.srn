@@ -1,0 +1,7 @@
+func main() => (
+     if (true) => {
+        print("true\n");
+     } else => {
+       print("never!\n");
+     }
+)

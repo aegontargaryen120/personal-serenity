@@ -183,6 +183,9 @@ func eCall(name, args, s) => (
     if (name == "println") => { return ePrintNative(name, args, s, true); }
     if (name == "eval") => { return eEvalNative(args, s); }
     if (name == "exit") => { return eExitNative(args, s); }
+    if (name == "shellex" || name == "file") => {
+        return [null, eErr(s, "'" + name + "' is only supported by the interpreter")];
+    }
     let function = eFindFunc(eFuncs(s), name);
     if (function != null) => { return eUserCall(name, function, args, s); }
     if (contains(eNativeNames(), name)) => { return eNativeCall(name, args, s); }
@@ -512,6 +515,10 @@ func eExpr(node, s) => (
     if (tag == "Identifier") => { return eIdent(at(node, 1), s); }
     if (tag == "ListLiteral") => { return eListLiteral(at(node, 1), s); }
     if (tag == "Call") => { return eCall(at(node, 1), at(node, 2), s); }
+    if (tag == "MethodCall") => {
+        return [null, eErr(s, "method call '" + at(node, 1) + "." + at(node, 2)
+            + "' is only supported by the interpreter")];
+    }
     if (tag == "Unary") => { return eUnary(node, s); }
     if (tag == "Conditional") => { return eConditional(node, s); }
     if (tag == "Binary") => { return eBinary(node, s); }

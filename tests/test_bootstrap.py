@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # frames deep enough to blow the default CPython recursion limit.
 sys.setrecursionlimit(100000)
 
-from src import scanner, parser, evaluator
+from src import scanner, parser, evaluator, code_generator
 from src import ast_nodes as nodes
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -126,6 +126,8 @@ def _to_tree(node):
                 _to_tree(node.if_true), _to_tree(node.if_false)]
     if isinstance(node, nodes.Call):
         return ['Call', node.callee, [_to_tree(a) for a in node.arguments]]
+    if isinstance(node, nodes.MethodCall):
+        return ['MethodCall', node.receiver, node.method, [_to_tree(a) for a in node.arguments]]
     if isinstance(node, nodes.ListLiteral):
         return ['ListLiteral', [_to_tree(e) for e in node.elements]]
     raise AssertionError(f'cannot convert {node!r} to a tree')
@@ -229,6 +231,40 @@ class _Harness:
         except Exception as error:  # noqa: BLE001 - operator errors are data
             return 'RUNTIME ERROR: ' + str(error) + '\n'
 
+    @staticmethod
+    def selfhost_compile(source_text):
+        """Run the bootstrap compiler's `cgen(parse(scan(...)))` on
+        SOURCE_TEXT and return the emitted assembly, or the printed
+        "COMPILE ERROR: ..." line followed by nothing when compilation
+        fails."""
+        with open(os.path.join(BOOTSTRAP_DIR, 'scanner.srn')) as handle:
+            scanner_source = handle.read()
+        with open(os.path.join(BOOTSTRAP_DIR, 'parser.srn')) as handle:
+            parser_source = handle.read()
+        with open(os.path.join(BOOTSTRAP_DIR, 'code_generator.srn')) as handle:
+            cgen_source = handle.read()
+        driver = (
+            scanner_source
+            + parser_source
+            + cgen_source
+            + 'func main() => (\n'
+            + f'    print(cgen(parse(scan({_serenity_literal(source_text)}))));\n'
+            + ')\n'
+        )
+        return _Harness.interpret(driver)
+
+    @staticmethod
+    def host_compile(source_text):
+        """Compile SOURCE_TEXT with the host compiler, conventions as for the
+        bootstrap compiler: failed programs compile to the text
+        "COMPILE ERROR: <message>\\n"."""
+        try:
+            tokens = scanner.Scanner(source_text).scan_tokens()
+            program = parser.Parser(tokens).parse()
+            return code_generator.CodeGen(program).generate()
+        except code_generator.CompileError as error:
+            return 'COMPILE ERROR: ' + str(error) + '\n'
+
 
 class ScannerParityTests(unittest.TestCase):
     _SOURCES = [
@@ -256,6 +292,9 @@ class ScannerParityTests(unittest.TestCase):
         '{ } [ ] ( ) , ; ? :',
         'length([1, 2]) >= 2 ? "big" : "small"',
         'for (let i = 0; i < 3; i++) => { println(i); }',
+        'f.write("x");',
+        'a.b(1, 2);',
+        'let f = "out.txt"; file(f); f.write("hi");',
     ]
 
     def test_all_samples_match_host_scanner(self):
@@ -294,10 +333,10 @@ class ScannerParityTests(unittest.TestCase):
 class ScannerErrorTests(unittest.TestCase):
     def test_unexpected_character(self):
         self.assertEqual(
-            _Harness.selfhost_scan('let f = 2.5;'),
-            "SCAN ERROR: unexpected character '.'\n"
+            _Harness.selfhost_scan('let f = 2#5;'),
+            "SCAN ERROR: unexpected character '#'\n"
             '[[2, let, 1, 1], [6, f, 1, 5], [34, =, 1, 7], [7, 2, 1, 9], '
-            '[0, ., 1, 10], [7, 5, 1, 11], [12, ;, 1, 12], [43, , 1, 13]]\n',
+            '[0, #, 1, 10], [7, 5, 1, 11], [12, ;, 1, 12], [43, , 1, 13]]\n',
         )
 
     def test_at_sign_is_an_error_token(self):
@@ -358,6 +397,9 @@ class ParserParityTests(unittest.TestCase):
         'func main() => ( if (flag) => { } )',
         'func main() => ( null; true; false; )',
         'func main() => ( let s = "esc \\n \\t \\r \\" \\\\"; )',
+        'func main() => ( let f = "out.txt"; file(f); f.write("a"); f.write(1 + 2); f.close(); )',
+        'func main() => ( g.write(); )',
+        'func main() => ( order.line("x", y); )',
         '// leading comment\nfunc main() => ( 0; ) // trailing comment',
         '/* block\ncomment */ func main() => ( 1; )',
     ]
@@ -626,6 +668,126 @@ class EvaluatorErrorTests(unittest.TestCase):
                 )
 
 
+class CodegenParityTests(unittest.TestCase):
+    """Run small programs through the bootstrap compiler
+    (`cgen(parse(scan(...)))`) and through the host compiler directly; the
+    emitted assembly must be byte-identical."""
+
+    _SOURCES = [
+        'func main() => ( println(42); )',
+        'func main() => ( println("hello"); )',
+        'func main() => ( println(1 + 2 * 3); )',
+        'func main() => ( let x = 1; let y = 2; println(x + y); )',
+        'func main() => ( println(true); println(false); println(null); )',
+        'func main() => ( println("a" + "b"); println("x" == "x"); '
+        'println("x" != "y"); )',
+        'func main() => ( let s = "abc"; println(s + s); println(s == "abc"); '
+        'println(s != "x"); )',
+        'func main() => ( let x = 5; x = x + 1; println(x); )',
+        'func main() => ( let x = 5; x = "s"; println(x); )',
+        'func main() => ( let x = "a"; x = "b" + x; println(x); )',
+        'func main() => ( let x = 5; let y = x; y = 9; println(x); println(y); )',
+        'func main() => ( let b = 3 > 2 ? 100 : 200; println(b); )',
+        'func main() => ( println(1 < 2 && 2 < 3); println(1 > 2 || 3 > 2); )',
+        'func main() => ( println(2 ^ 10); println(7 % 3); println(7 / 2); '
+        'println(-5); println(-x + 3); )',
+        'func incr(n) => ( return n + 1; )\n'
+        'func main() => ( println(incr(incr(41))); )',
+        'func empty() => ( return 7; )\nfunc main() => ( println(empty()); )',
+        'func f(s) => ( return s + "!"; )\n'
+        'func main() => ( println(f("hey")); )',
+        'func apply(f, x) => ( return f(x); )\n'
+        'func dbl(n) => ( return n * 2; )\n'
+        'func main() => ( println(apply(dbl, 21)); )',
+        'func main() => ( let n = 0; let s = ""; '
+        'while (n < 3) => { s = s + "x"; n = n + 1; } println(s); println(n); )',
+        'func main() => ( let i = 100; '
+        'for (let i = 0; i < 2; i++) => { println(i); } println(i); )',
+        'func main() => ( let r = 0; '
+        'for (let i = 0; i < 5; i++) => { '
+        'if (i == 3) => { r = 100; } } println(r); )',
+        'func main() => ( if ("a" == "a") => { println("eq"); } '
+        'else => { println("ne"); } )',
+        'func main() => ( println(3 <= 4 ? "y" : "n"); )',
+        'func main() => ( println(charAt("hi", 0)); '
+        'println(substring("hello", 1, 4)); println(toLower("ABC")); )',
+        'func main() => ( println(toUpper(substring("hello world", 0, 5))); )',
+        'func main() => ( let s = trim("  hi  "); println(s + charAt(s, 1)); )',
+        'func main() => ( println(join(["a", "b"], "-")); '
+        'println(toString(42)); println(toInt("17") + 3); )',
+        'func main() => ( let y = "hi"; println(y == "hi"); )',
+        'func main() => ( let a = "ab"; let b = "cd"; '
+        'println(a + b == "abcd"); )',
+        'func main() => ( let i = 0; let acc = ""; '
+        'while (i < 3) => { acc = acc + toString(i); i = i + 1; } '
+        'println(acc); )',
+        'func greet(name) => ( return "Hi, " + name; )\n'
+        'func main() => ( let total = 0; '
+        'for (let i = 0; i < 3; i++) => { total = total + i; } '
+        'println(greet("World")); println(total); '
+        'println("total: " + toString(6 * 7)); '
+        'println(greet("Once") == "Hi, Once"); )',
+        'func main() => ( println("before"); exit(); println("after"); )',
+    ]
+
+    def test_all_samples_match_host_compiler(self):
+        for source in self._SOURCES:
+            with self.subTest(source=source):
+                self.assertEqual(
+                    _Harness.selfhost_compile(source),
+                    _Harness.host_compile(source),
+                )
+
+
+class CodegenErrorTests(unittest.TestCase):
+    """The host compiler raises CompileError where the bootstrap compiler
+    prints "COMPILE ERROR: ..." and yields no assembly. Each assertion pins the
+    bootstrap's message; the host raises with equivalent text."""
+
+    def assert_compile_error(self, source, message):
+        self.assertEqual(
+            _Harness.selfhost_compile(source),
+            'COMPILE ERROR: ' + message + '\n',
+        )
+
+    def test_no_main_function(self):
+        self.assert_compile_error(
+            '',
+            "program must declare exactly one 'main' function",
+        )
+
+    def test_undefined_variable(self):
+        self.assert_compile_error(
+            'func main() => ( let x = y; )',
+            "undefined variable 'y'",
+        )
+
+    def test_cannot_concatenate_string(self):
+        self.assert_compile_error(
+            'func main() => ( println(1 + "a"); )',
+            'cannot concatenate a string with a non-string',
+        )
+
+    def test_null_in_numeric_expression(self):
+        self.assert_compile_error(
+            'func main() => ( null; )',
+            'null cannot be used in a numeric expression',
+        )
+
+    def test_error_pins_match_host_text(self):
+        for source in (
+            '',
+            'func main() => ( let x = y; )',
+            'func main() => ( println(1 + "a"); )',
+            'func main() => ( null; )',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    _Harness.selfhost_compile(source),
+                    _Harness.host_compile(source),
+                )
+
+
 class SelfHostMilestoneTests(unittest.TestCase):
     def test_evaluator_interprets_its_own_pipeline(self):
         """The bootstrap scanner, parser and evaluator, interpreted by the
@@ -646,6 +808,31 @@ class SelfHostMilestoneTests(unittest.TestCase):
             'scan("func main() => ( println(6 * 7); )")));\n'
             + '    let s = eSt(r);\n'
             + '    print("STATUS=" + toString(eStatus(s)) + "\\n");\n'
+            + ')\n'
+        )
+        self.assertEqual(
+            _Harness.selfhost_interpret(own_source),
+            _Harness.interpret(own_source),
+        )
+
+    def test_codegen_compiles_its_own_pipeline(self):
+        """The bootstrap scanner, parser and code generator, interpreted by
+        the bootstrap interpreter itself, compile a target program end to
+        end - the final self-hosting milestone. (This runs the whole
+        compiler under the bootstrap interpreter and is therefore slow.)"""
+        with open(os.path.join(BOOTSTRAP_DIR, 'scanner.srn')) as handle:
+            scanner_source = handle.read()
+        with open(os.path.join(BOOTSTRAP_DIR, 'parser.srn')) as handle:
+            parser_source = handle.read()
+        with open(os.path.join(BOOTSTRAP_DIR, 'code_generator.srn')) as handle:
+            cgen_source = handle.read()
+        own_source = (
+            scanner_source
+            + parser_source
+            + cgen_source
+            + 'func main() => (\n'
+            + '    print(cgen(parse('
+            'scan("func main() => ( println(6 * 7); )"))));\n'
             + ')\n'
         )
         self.assertEqual(

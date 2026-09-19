@@ -1,10 +1,14 @@
 from .binary_ops import apply as apply_operator, OperationError
+from .ast_nodes import Identifier
 from .string_builtins import (
     char_at, substring, to_upper, to_lower, trim, to_int,
 )
 from .list_builtins import (
     length, contains, index_of, at, append, prepend, head, tail, reverse,
     concat, join, to_string,
+)
+from .system_builtins import (
+    SerenityFile, shell_exec, open_file, write_line, close_file,
 )
 
 
@@ -75,6 +79,22 @@ class Evaluator:
             self._require_arity(name, arguments, 1)
             code = self._evaluate(arguments[0], caller_environment)
             raise SystemExit(code)
+        if name == 'shellex':
+            self._require_arity(name, arguments, 1)
+            command = self._evaluate(arguments[0], caller_environment)
+            if not isinstance(command, str):
+                raise RuntimeError(f"shellex expects a string command, got {self._value_kind(command)}")
+            return shell_exec(command)
+        if name == 'file':
+            self._require_arity(name, arguments, 1)
+            argument = arguments[0]
+            path = self._evaluate(argument, caller_environment)
+            if not isinstance(path, str):
+                raise RuntimeError(f"file expects a string path, got {self._value_kind(path)}")
+            handle = open_file(path)
+            if isinstance(argument, Identifier) and argument.name in caller_environment:
+                caller_environment[argument.name] = handle
+            return handle
         function = self.functions.get(name)
         if function is not None:
             if len(function.params) != len(arguments):
@@ -95,6 +115,23 @@ class Evaluator:
             except OperationError as error:
                 raise RuntimeError(str(error)) from None
         raise RuntimeError(f"undefined function '{name}'")
+
+    def _call_method(self, receiver, method, arguments, caller_environment):
+        if receiver not in caller_environment:
+            raise RuntimeError(f"undefined variable '{receiver}'")
+        value = caller_environment[receiver]
+        if not isinstance(value, SerenityFile):
+            raise RuntimeError(f"'{receiver}.{method}' is only supported on file handles returned by 'file'")
+        if method == 'write':
+            self._require_arity(f'{receiver}.write', arguments, 1)
+            text = self._evaluate(arguments[0], caller_environment)
+            write_line(value, str(self._display(text)))
+            return None
+        if method == 'close':
+            self._require_arity(f'{receiver}.close', arguments, 0)
+            close_file(value)
+            return None
+        raise RuntimeError(f"undefined method '{receiver}.{method}'")
 
     def _execute_statements(self, statements, environment):
         from .ast_nodes import LetStmt, AssignStmt, IfStmt, WhileStmt, ForStmt, IncrementStmt, ReturnStmt
@@ -174,11 +211,29 @@ class Evaluator:
             return 'null'
         if isinstance(value, tuple):
             return to_string(value)
+        if isinstance(value, SerenityFile):
+            return f'<file: {value.path}>'
         return value
+
+    @staticmethod
+    def _value_kind(value):
+        if value is True or value is False:
+            return 'bool'
+        if value is None:
+            return 'null'
+        if isinstance(value, str):
+            return 'string'
+        if isinstance(value, int):
+            return 'integer'
+        if isinstance(value, tuple):
+            return 'list'
+        if isinstance(value, SerenityFile):
+            return 'file'
+        return type(value).__name__
 
     def _evaluate(self, expression, environment=None):
         environment = {} if environment is None else environment
-        from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, ListLiteral
+        from .ast_nodes import IntLiteral, StringLiteral, BoolLiteral, NullLiteral, Identifier, Binary, Unary, Conditional, Call, MethodCall, ListLiteral
         if isinstance(expression, IntLiteral) or isinstance(expression, StringLiteral) or isinstance(expression, BoolLiteral):
             return expression.value
         if isinstance(expression, NullLiteral):
@@ -191,6 +246,8 @@ class Evaluator:
             return environment[expression.name]
         if isinstance(expression, Call):
             return self._call(expression.callee, expression.arguments, environment)
+        if isinstance(expression, MethodCall):
+            return self._call_method(expression.receiver, expression.method, expression.arguments, environment)
         if isinstance(expression, Unary):
             value = self._evaluate(expression.operand, environment)
             if expression.operator == '-':

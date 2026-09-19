@@ -130,6 +130,76 @@
   nests interpreter frames beyond CPython's default 1000. Mixed-type operators
   the host cannot evaluate (e.g. `null + 1`) crash the host with a TypeError
   and are out of scope for error pins.
-** TODO Start building - self-hosted code generator
+** DONE Start building - self-hosted code generator
 - Reimplement src/code_generator.py in Serenity, walking the bootstrap
   parser's nested-list tree to emit ARM64 assembly.
+  - bootstrap/code_generator.srn (2666 lines) exposes cgen(program) -> assembly
+    text, or prints "COMPILE ERROR: ..." and returns "" where the host raises
+    CompileError. State is threaded as an 11-element list
+    [strings, label, variables, offsets, types, next, returnLabel, paramCache,
+    returnCache, failed, functions]; helpers are prefixed `cg` for inlining
+    alongside scanner.srn and parser.srn.
+  - Constant expressions are folded at compile time; runtime values (loop
+    variables, string builtins, comparisons involving computed strings) fall
+    back to `_serenity_*` helpers. String literals go to the data section and
+    must be written before a runtime value is emitted, so the statement walk is
+    a single sequential pass.
+  - The fixed ARM64 subroutines (`_serenity_print_int`, `_serenity_str_cmp`,
+    `_serenity_concat`, ...) were transcribed byte-for-byte from the host
+    source, as was the approximate Serenity `^`/`toString` behaviour.
+- Added tests: a 31-program parity corpus (byte-for-byte identical assembly
+  against the host compiler), four compile-error pins matching the host's
+  CompileError text, and the full scanner+parser+code_generator pipeline
+  compiling a target program under the bootstrap interpreter itself (the
+  fourth self-hosting milestone; slow, ~47s). Full suite is 43 bootstrap tests
+  and green.
+- Notes: the bootstrap driver must run with a raised Python recursion limit;
+  mixed-type expressions the host cannot fold (e.g. `1 + null`) crash the host
+  with a TypeError and are out of scope. The code generator milestone makes the
+  whole suite ~80s.
+
+* DONE 2026-09-19 Metaprogramming: `shellex` + `file` file-writing         :stdlib:interpreter
+  - Goal: `shellex("<cmd>")` runs a shell command and returns its exit code;
+    `let f = "<path>"; file(f); f.write(text); f.close();` opens a file for
+    writing, `.write()` appends the text plus a newline, and `.close()` flushes
+    and saves. These are interpreter-only builtins for now.
+- Design decisions:
+  - `.` was previously a scan error (`let f = 2.5;`). It is now a DOT token.
+    Appended AFTER EOF in the TokenType enum (type 44) so all existing token IDs
+    (EOF=43, etc.) stay stable; bootstrap/scanner.srn mirrors the 1-based IDs.
+  - New `MethodCall(receiver, method, arguments)` AST node + parser support:
+    receiver.<method>(args) is accepted for an identifier receiver only, no
+    chaining or arbitrary-expression receivers.
+  - `file(path)` opens the handle for writing and creates missing parent
+    directories. When the argument is a bare `Identifier`, the variable itself
+    is REBOUND to the handle (so `let f = "x"; file(f); f.write(..)` works);
+    it also returns the handle, so `let g = file("x"); g.write(..)` works too.
+  - `shellex` uses subprocess.run(shell=True, capture_output=True, text=True),
+    replays stdout+stderr to the program's own stdout (StringIO harnesses
+    capture it) and returns the return code.
+  - `f.write(text)` calls `str(_display(text))` then appends `'\n'`; handles
+    render as `<file: {path}>` in output.
+  - Both are host-side only. The compiled code generator raises clear
+    CompileError text for `shellex`/`file` and for any MethodCall; the
+    bootstrap evaluator reports them as interpreter-only runtime errors.
+- Files touched:
+  - scanner: src/scanner.py (DOT after EOF, '.' mapping), bootstrap/scanner.srn
+    (type 44 branch + header comment).
+  - parser: src/ast_nodes.py (MethodCall), src/parser.py (_primary), and the
+    matching bootstrap/parser.srn pPrimary branch (DOT 44).
+  - builtins: src/system_builtins.py (new: SerenityFile, shell_exec, open_file,
+    write_line, close_file) wired into src/evaluator.py (_call, _call_method,
+    _evaluate, _display, _value_kind).
+  - codegen: src/code_generator.py (INTERPRETER_ONLY_FUNCTIONS; rejections in
+    _compile_runtime_call, _validate_initializer, _expression; MethodCall is a
+    runtime value so it routes to the interpreter-only error).
+  - bootstrap/evaluator.srn: eExpr MethodCall branch + shellex/file rejection.
+- Tests: 9 new SystemBuiltinTests (shellex exit codes incl. a failing command,
+  file write/close round trip, parent-dir creation, returned-handle form,
+  bad-argument and non-handle error pins). Bootstrap corpus gained method-call
+  scanner/parser samples; `test_unexpected_character` now pins `2#5` instead of
+  `2.5`; `_to_tree` converts MethodCall. Full suite: 217 tests green (~147s in
+  this checkout; bootstrap codegen tests dominate).
+- Notes: compiled mode correctly rejects these features, so they remain
+  interpreter-only for now. The scanner/parser/code_generator all self-host,
+  but the bootstrap evaluator intentionally does not implement host I/O.

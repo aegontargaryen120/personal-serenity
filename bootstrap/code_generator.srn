@@ -1,0 +1,2666 @@
+// Serenity bootstrap: code generator
+//
+// The third stage of bootstrapping the Serenity compiler in itself. This
+// module re-implements src/code_generator.py as ordinary Serenity functions
+// and walks the bootstrap parser's nested-list tree (see parser.srn) to emit
+// the exact ARM64 assembly text the host generator produces.
+//
+// Contract:
+//   cgen(program) -> assembly text (or "" after a compile error)
+//
+// Errors cannot raise in Serenity: where the host generator raises
+// CompileError the bootstrap generator prints "COMPILE ERROR: ..." and
+// returns "" (the analogue of `raise` on the first error). Because there is
+// no mutable state, the generator's mutable fields (label counter, variable
+// tables, runtime slot allocator, string pool, caches, and a "failed" flag)
+// are threaded through every compile function as an 11-element state list:
+//   [strings, label, variables, offsets, types, next, returnLabel,
+//    paramCache, returnCache, failed, functions]
+// and every compile function returns [result, state]. Helper names are
+// prefixed `cg` so this module can be inlined alongside scanner.srn,
+// parser.srn and evaluator.srn without clashing.
+
+func cgMapFind(list, name) => (
+    let i = 0;
+    while (i < length(list)) => {
+        if (at(at(list, i), 0) == name) => { return at(at(list, i), 1); }
+        i = i + 1;
+    }
+    return null;
+)
+
+func cgMapSet(list, name, value) => (
+    let out = [];
+    let i = 0;
+    let done = false;
+    while (i < length(list)) => {
+        if (at(at(list, i), 0) == name) => {
+            out = append(out, [name, value]);
+            done = true;
+        }
+        else => { out = append(out, at(list, i)); }
+        i = i + 1;
+    }
+    if (!done) => { out = append(out, [name, value]); }
+    return out;
+)
+
+func cgMapHas(list, name) => (
+    return cgMapFind(list, name) != null;
+)
+
+func cgAppend(list, value) => (
+    return append(list, value);
+)
+
+func cgListCopy(list) => (
+    let out = [];
+    let i = 0;
+    while (i < length(list)) => {
+        out = append(out, at(list, i));
+        i = i + 1;
+    }
+    return out;
+)
+
+// --- Threaded state ------------------------------------------------------
+// st = [strings, label, variables, offsets, types, next, returnLabel,
+//       paramCache, returnCache, failed, functions]
+
+func cgStrings(st) => ( return at(st, 0); )
+func cgLabel(st) => ( return at(st, 1); )
+func cgVars(st) => ( return at(st, 2); )
+func cgOff(st) => ( return at(st, 3); )
+func cgTypes(st) => ( return at(st, 4); )
+func cgNext(st) => ( return at(st, 5); )
+func cgRetlbl(st) => ( return at(st, 6); )
+func cgPCache(st) => ( return at(st, 7); )
+func cgRCache(st) => ( return at(st, 8); )
+func cgFailed(st) => ( return at(st, 9); )
+func cgFuncs(st) => ( return at(st, 10); )
+
+func cgFail(st, msg) => (
+    println("COMPILE ERROR: " + msg);
+    return cgSetVal(st, 9, true);
+)
+
+func cgSetVal(st, idx, value) => (
+    let out = [];
+    let i = 0;
+    while (i < length(st)) => {
+        if (i == idx) => { out = append(out, value); }
+        else => { out = append(out, at(st, i)); }
+        i = i + 1;
+    }
+    return out;
+)
+
+func cgSetStrings(st, value) => ( return cgSetVal(st, 0, value); )
+func cgSetLabel(st, value) => ( return cgSetVal(st, 1, value); )
+func cgSetVars(st, value) => ( return cgSetVal(st, 2, value); )
+func cgSetOff(st, value) => ( return cgSetVal(st, 3, value); )
+func cgSetTypes(st, value) => ( return cgSetVal(st, 4, value); )
+func cgSetNext(st, value) => ( return cgSetVal(st, 5, value); )
+func cgSetRetlbl(st, value) => ( return cgSetVal(st, 6, value); )
+func cgSetPCache(st, value) => ( return cgSetVal(st, 7, value); )
+func cgSetRCache(st, value) => ( return cgSetVal(st, 8, value); )
+
+// --- Value helpers -------------------------------------------------------
+
+func cgIsTrue(v) => (
+    return v == true && toString(v) == "true";
+)
+func cgIsFalse(v) => (
+    return v == false && toString(v) == "false";
+)
+func cgIsBool(v) => (
+    return cgIsTrue(v) || cgIsFalse(v);
+)
+func cgIsNull(v) => (
+    return v == null;
+)
+func cgIsStr(v) => (
+    return !(v == true) && !(v == false) && toString(v) == v;
+)
+func cgIsList(v) => (
+    let s = toString(v);
+    return length(s) > 0 && charAt(s, 0) == "[";
+)
+func cgTruthy(v) => (
+    return !cgIsFalse(v) && !cgIsNull(v) && !(v == "") && !(v == 0) && !(v == []);
+)
+func cgKindName(kind) => (
+    if (kind == "int") => { return "integer"; }
+    if (kind == "bool") => { return "bool"; }
+    if (kind == "string") => { return "string"; }
+    if (kind == "null") => { return "null"; }
+    if (kind == "list") => { return "list"; }
+    return "value";
+)
+func cgTypeName(v) => (
+    if (cgIsBool(v)) => { return "bool"; }
+    if (cgIsNull(v)) => { return "null"; }
+    if (cgIsStr(v)) => { return "string"; }
+    if (cgIsList(v)) => { return "list"; }
+    return "integer";
+)
+func cgWidth(kind) => (
+    if (kind == "string") => { return 2; }
+    return 1;
+)
+func cgAlign16(size) => (
+    return ((size + 15) / 16) * 16;
+)
+
+func cgQuote(value) => (
+    let out = "\"";
+    let i = 0;
+    while (i < length(value)) => {
+        let c = charAt(value, i);
+        if (c == "\\") => { out = out + "\\\\"; }
+        else => {
+            if (c == "\"") => { out = out + "\\\""; }
+            else => {
+                if (c == "\n") => { out = out + "\\n"; }
+                else => {
+                    if (c == "\r") => { out = out + "\\r"; }
+                    else => {
+                        if (c == "\t") => { out = out + "\\t"; }
+                        else => { out = out + c; }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out + "\"";
+)
+
+func cgNewString(st, value) => (
+    let label = "L_string_" + toString(length(cgStrings(st)));
+    let strings = cgAppend(cgStrings(st), [label, value]);
+    return [label, length(value), cgSetStrings(st, strings)];
+)
+
+// --- Builtin name tables -------------------------------------------------
+
+func cgSpArity(name) => (
+    if (name == "charAt") => { return 2; }
+    if (name == "substring") => { return 3; }
+    if (name == "toUpper") => { return 1; }
+    if (name == "toLower") => { return 1; }
+    if (name == "trim") => { return 1; }
+    if (name == "join") => { return 2; }
+    if (name == "toString") => { return 1; }
+    return 0;
+)
+func cgIsStringProducing(name) => (
+    return cgSpArity(name) != 0;
+)
+func cgSpHelper(name) => (
+    if (name == "charAt") => { return "_serenity_char_at"; }
+    if (name == "substring") => { return "_serenity_substring"; }
+    if (name == "toUpper") => { return "_serenity_to_upper"; }
+    if (name == "toLower") => { return "_serenity_to_lower"; }
+    if (name == "trim") => { return "_serenity_trim"; }
+    return "";
+)
+func cgNumArity(name) => (
+    if (name == "length") => { return 1; }
+    if (name == "contains") => { return 2; }
+    if (name == "indexOf") => { return 2; }
+    if (name == "toInt") => { return 1; }
+    return 0;
+)
+func cgIsNumeric(name) => (
+    return cgNumArity(name) != 0;
+)
+func cgListArity(name) => (
+    if (name == "at") => { return 2; }
+    if (name == "append") => { return 2; }
+    if (name == "prepend") => { return 2; }
+    if (name == "head") => { return 1; }
+    if (name == "tail") => { return 1; }
+    if (name == "reverse") => { return 1; }
+    if (name == "concat") => { return 2; }
+    return 0;
+)
+func cgIsListFn(name) => (
+    return cgListArity(name) != 0;
+)
+func cgListKind(name) => (
+    if (name == "append") => { return "list"; }
+    if (name == "prepend") => { return "list"; }
+    if (name == "reverse") => { return "list"; }
+    if (name == "concat") => { return "list"; }
+    return "unknown";
+)
+func cgIsBuiltin(name) => (
+    return cgIsStringProducing(name) || cgIsNumeric(name) || cgIsListFn(name);
+)
+func cgBuiltinArity(name) => (
+    if (cgIsStringProducing(name)) => { return cgSpArity(name); }
+    if (cgIsNumeric(name)) => { return cgNumArity(name); }
+    return cgListArity(name);
+)
+func cgIsStringSubject(name) => (
+    if (name == "length") => { return true; }
+    if (name == "contains") => { return true; }
+    if (name == "indexOf") => { return true; }
+    if (name == "toInt") => { return true; }
+    if (name == "charAt") => { return true; }
+    if (name == "substring") => { return true; }
+    if (name == "toUpper") => { return true; }
+    if (name == "toLower") => { return true; }
+    if (name == "trim") => { return true; }
+    return false;
+)
+
+// --- Env / list helpers --------------------------------------------------
+
+func cgEnvSet(env, name, value) => (
+    return cgMapSet(env, name, value);
+)
+func cgEnvGet(env, name) => (
+    return cgMapFind(env, name);
+)
+func cgEnvCopy(env) => (
+    return cgListCopy(env);
+)
+func cgSetListAt(list, index, value) => (
+    let out = [];
+    let i = 0;
+    while (i < length(list)) => {
+        if (i == index) => { out = append(out, value); }
+        else => { out = append(out, at(list, i)); }
+        i = i + 1;
+    }
+    return out;
+)
+func cgWordKinds(n) => (
+    let out = [];
+    let i = 0;
+    while (i < n) => {
+        out = append(out, "word");
+        i = i + 1;
+    }
+    return out;
+)
+
+// --- Constant folding ----------------------------------------------------
+
+func cgFoldArithmetic(op, l, r) => (
+    if (op == "+") => { return l + r; }
+    if (op == "-") => { return l - r; }
+    if (op == "*") => { return l * r; }
+    if (op == "/") => { return l / r; }
+    if (op == "%") => { return l % r; }
+    return l ^ r;
+)
+func cgRelational(op, l, r) => (
+    if (op == "<") => { return l < r; }
+    if (op == "<=") => { return l <= r; }
+    if (op == ">") => { return l > r; }
+    return l >= r;
+)
+
+func cgFoldBinary(st, op, l, r) => (
+    if (op == "+") => {
+        if (cgIsStr(l) || cgIsStr(r)) => {
+            if (cgIsStr(l) && cgIsStr(r)) => { return [l + r, st]; }
+            if (cgIsNull(l) || cgIsNull(r)) => {
+                return [null, cgFail(st, "cannot concatenate a string with null")];
+            }
+            return [null, cgFail(st, "cannot concatenate a string with a non-string")];
+        }
+        if (cgIsList(l) || cgIsList(r)) => {
+            if (!(cgIsList(l) && cgIsList(r))) => {
+                return [null, cgFail(st, "cannot concatenate a list with a non-list")];
+            }
+            return [concat(l, r), st];
+        }
+        return [cgFoldArithmetic("+", l, r), st];
+    }
+    if (op == "-" || op == "*" || op == "/" || op == "%" || op == "^") => {
+        if (cgIsList(l) || cgIsList(r)) => {
+            return [null, cgFail(st, "cannot use '" + op + "' on lists")];
+        }
+        if ((op == "/" || op == "%") && r == 0) => {
+            return [null, cgFail(st, "division by zero")];
+        }
+        return [cgFoldArithmetic(op, l, r), st];
+    }
+    if (op == "==") => { return [l == r, st]; }
+    if (op == "!=") => { return [l != r, st]; }
+    if (cgIsStr(l) != cgIsStr(r)) => {
+        return [null, cgFail(st, "cannot compare " + cgTypeName(l) + " with "
+            + cgTypeName(r) + " using '" + op + "'")];
+    }
+    if (cgIsList(l) || cgIsList(r)) => {
+        return [null, cgFail(st, "cannot compare lists using '" + op + "'")];
+    }
+    return [cgRelational(op, l, r), st];
+)
+
+func cgBuiltinResult(st, name, args) => (
+    if (name == "length") => { return [length(at(args, 0)), st]; }
+    if (name == "contains") => { return [contains(at(args, 0), at(args, 1)), st]; }
+    if (name == "indexOf") => { return [indexOf(at(args, 0), at(args, 1)), st]; }
+    if (name == "toInt") => { return [toInt(at(args, 0)), st]; }
+    if (name == "charAt") => { return [charAt(at(args, 0), at(args, 1)), st]; }
+    if (name == "substring") => { return [substring(at(args, 0), at(args, 1), at(args, 2)), st]; }
+    if (name == "toUpper") => { return [toUpper(at(args, 0)), st]; }
+    if (name == "toLower") => { return [toLower(at(args, 0)), st]; }
+    if (name == "trim") => { return [trim(at(args, 0)), st]; }
+    if (name == "join") => { return [join(at(args, 0), at(args, 1)), st]; }
+    if (name == "toString") => { return [toString(at(args, 0)), st]; }
+    if (name == "at") => { return [at(at(args, 0), at(args, 1)), st]; }
+    if (name == "append") => { return [append(at(args, 0), at(args, 1)), st]; }
+    if (name == "prepend") => { return [prepend(at(args, 0), at(args, 1)), st]; }
+    if (name == "head") => { return [head(at(args, 0)), st]; }
+    if (name == "tail") => { return [tail(at(args, 0)), st]; }
+    if (name == "reverse") => { return [reverse(at(args, 0)), st]; }
+    if (name == "concat") => { return [concat(at(args, 0), at(args, 1)), st]; }
+    return [null, cgFail(st, "unsupported call '" + name + "' in compiled expression")];
+)
+
+func cgConstantValue(st, expr) => (
+    let tag = at(expr, 0);
+    if (tag == "IntLiteral") => { return [at(expr, 1), st]; }
+    if (tag == "StringLiteral") => { return [at(expr, 1), st]; }
+    if (tag == "BoolLiteral") => { return [at(expr, 1), st]; }
+    if (tag == "NullLiteral") => { return [null, st]; }
+    if (tag == "ListLiteral") => {
+        let elems = at(expr, 1);
+        let out = [];
+        let i = 0;
+        while (i < length(elems)) => {
+            let r = cgConstantValue(st, at(elems, i));
+            st = at(r, 1);
+            if (cgFailed(st)) => { return [null, st]; }
+            out = append(out, at(r, 0));
+            i = i + 1;
+        }
+        return [out, st];
+    }
+    if (tag == "Identifier") => {
+        let name = at(expr, 1);
+        if (cgMapHas(cgOff(st), name)) => {
+            return [null, cgFail(st, "variable '" + name + "' holds a runtime value")];
+        }
+        if (!cgMapHas(cgVars(st), name)) => {
+            return [null, cgFail(st, "undefined variable '" + name + "'")];
+        }
+        return cgConstantValue(st, cgMapFind(cgVars(st), name));
+    }
+    if (tag == "Call") => {
+        let callee = at(expr, 1);
+        let args = at(expr, 2);
+        if (callee == "eval") => {
+            if (length(args) != 1) => {
+                return [null, cgFail(st, "eval expects one argument")];
+            }
+            return cgConstantValue(st, at(args, 0));
+        }
+        if (!cgIsBuiltin(callee)) => {
+            return [null, cgFail(st, "unsupported call '" + callee + "' in compiled expression")];
+        }
+        let arity = cgBuiltinArity(callee);
+        if (length(args) != arity) => {
+            return [null, cgFail(st, callee + " expects " + toString(arity)
+                + " argument(s), got " + toString(length(args)))];
+        }
+        let values = [];
+        let i = 0;
+        while (i < length(args)) => {
+            let r = cgConstantValue(st, at(args, i));
+            st = at(r, 1);
+            if (cgFailed(st)) => { return [null, st]; }
+            values = append(values, at(r, 0));
+            i = i + 1;
+        }
+        return cgBuiltinResult(st, callee, values);
+    }
+    if (tag == "Unary") => {
+        let op = at(expr, 1);
+        let r = cgConstantValue(st, at(expr, 2));
+        if (cgFailed(at(r, 1))) => { return [null, at(r, 1)]; }
+        let value = at(r, 0);
+        if (op == "-") => { return [0 - value, at(r, 1)]; }
+        if (cgTruthy(value)) => { return [false, at(r, 1)]; }
+        return [true, at(r, 1)];
+    }
+    if (tag == "Conditional") => {
+        let c = cgConstantValue(st, at(expr, 1));
+        if (cgFailed(at(c, 1))) => { return [null, at(c, 1)]; }
+        if (cgTruthy(at(c, 0))) => {
+            return cgConstantValue(at(c, 1), at(expr, 2));
+        }
+        return cgConstantValue(at(c, 1), at(expr, 3));
+    }
+    if (tag == "Binary") => {
+        let left = cgConstantValue(st, at(expr, 1));
+        if (cgFailed(at(left, 1))) => { return [null, at(left, 1)]; }
+        let op = at(expr, 2);
+        if (op == "&&") => {
+            if (cgTruthy(at(left, 0))) => {
+                let r = cgConstantValue(at(left, 1), at(expr, 3));
+                if (cgFailed(at(r, 1))) => { return [null, at(r, 1)]; }
+                if (cgTruthy(at(r, 0))) => { return [true, at(r, 1)]; }
+                return [false, at(r, 1)];
+            }
+            return [false, at(left, 1)];
+        }
+        if (op == "||") => {
+            if (cgTruthy(at(left, 0))) => { return [true, at(left, 1)]; }
+            let r = cgConstantValue(at(left, 1), at(expr, 3));
+            if (cgFailed(at(r, 1))) => { return [null, at(r, 1)]; }
+            if (cgTruthy(at(r, 0))) => { return [true, at(r, 1)]; }
+            return [false, at(r, 1)];
+        }
+        let right = cgConstantValue(at(left, 1), at(expr, 3));
+        if (cgFailed(at(right, 1))) => { return [null, at(right, 1)]; }
+        return cgFoldBinary(at(right, 1), op, at(left, 0), at(right, 0));
+    }
+    return [null, cgFail(st, "expression is not a compile-time value")];
+)
+
+func cgContainsRuntimeValue(st, expr) => (
+    let tag = at(expr, 0);
+    if (tag == "Identifier") => { return cgMapHas(cgOff(st), at(expr, 1)); }
+    if (tag == "ListLiteral") => {
+        let elems = at(expr, 1);
+        let i = 0;
+        while (i < length(elems)) => {
+            if (cgContainsRuntimeValue(st, at(elems, i))) => { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (tag == "Call") => {
+        let fn = cgMapFind(cgFuncs(st), at(expr, 1));
+        if (fn != null) => { return true; }
+        let args = at(expr, 2);
+        let i = 0;
+        while (i < length(args)) => {
+            if (cgContainsRuntimeValue(st, at(args, i))) => { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (tag == "Binary") => {
+        return cgContainsRuntimeValue(st, at(expr, 1))
+            || cgContainsRuntimeValue(st, at(expr, 3));
+    }
+    if (tag == "Unary") => { return cgContainsRuntimeValue(st, at(expr, 2)); }
+    if (tag == "Conditional") => {
+        return cgContainsRuntimeValue(st, at(expr, 1))
+            || cgContainsRuntimeValue(st, at(expr, 2))
+            || cgContainsRuntimeValue(st, at(expr, 3));
+    }
+    return false;
+)
+
+// --- Environment / static kinds -----------------------------------------
+
+func cgCurrentEnv(st) => (
+    let env = cgEnvCopy(cgTypes(st));
+    let names = [];
+    let i = 0;
+    while (i < length(cgVars(st))) => {
+        names = append(names, at(at(cgVars(st), i), 0));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < length(names)) => {
+        let name = at(names, i);
+        if (!cgMapHas(env, name)) => {
+            let kind = cgStaticKind(st, cgMapFind(cgVars(st), name), env, [name]);
+            env = cgEnvSet(env, name, kind);
+        }
+        i = i + 1;
+    }
+    return env;
+)
+
+func cgStaticKindOfEnv(kind) => (
+    if (kind == "int") => { return "int"; }
+    if (kind == "bool") => { return "bool"; }
+    if (kind == "string") => { return "string"; }
+    if (kind == "null") => { return "null"; }
+    return "unknown";
+)
+
+func cgStaticKind(st, expr, env, seen) => (
+    let tag = at(expr, 0);
+    if (tag == "IntLiteral") => { return "int"; }
+    if (tag == "BoolLiteral") => { return "bool"; }
+    if (tag == "StringLiteral") => { return "string"; }
+    if (tag == "NullLiteral") => { return "null"; }
+    if (tag == "ListLiteral") => { return "list"; }
+    if (tag == "Identifier") => {
+        let name = at(expr, 1);
+        if (cgMapHas(env, name)) => {
+            return cgStaticKindOfEnv(cgEnvGet(env, name));
+        }
+        if (cgMapHas(cgTypes(st), name)) => { return cgMapFind(cgTypes(st), name); }
+        if (cgMapHas(cgVars(st), name)) => {
+            let i = 0;
+            while (i < length(seen)) => {
+                if (at(seen, i) == name) => { return "unknown"; }
+                i = i + 1;
+            }
+            return cgStaticKind(st, cgMapFind(cgVars(st), name), env,
+                cgAppend(seen, name));
+        }
+        return "unknown";
+    }
+    if (tag == "Unary") => {
+        if (at(expr, 1) == "!") => { return "bool"; }
+        return cgStaticKind(st, at(expr, 2), env, seen);
+    }
+    if (tag == "Binary") => {
+        let op = at(expr, 2);
+        if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">"
+            || op == ">=" || op == "&&" || op == "||") => { return "bool"; }
+        if (op == "+") => {
+            let lk = cgStaticKind(st, at(expr, 1), env, seen);
+            let rk = cgStaticKind(st, at(expr, 3), env, seen);
+            if (lk == "string" || rk == "string") => { return "string"; }
+            if (lk == "list" || rk == "list") => { return "list"; }
+            return "int";
+        }
+        return "int";
+    }
+    if (tag == "Conditional") => {
+        let tk = cgStaticKind(st, at(expr, 2), env, seen);
+        let ek = cgStaticKind(st, at(expr, 3), env, seen);
+        if (tk == ek) => { return tk; }
+        return "unknown";
+    }
+    if (tag == "Call") => {
+        let callee = at(expr, 1);
+        if (cgIsStringProducing(callee)) => { return "string"; }
+        if (cgIsNumeric(callee)) => { return "int"; }
+        if (cgIsListFn(callee)) => { return cgListKind(callee); }
+        if (callee == "eval") => {
+            let args = at(expr, 2);
+            if (length(args) == 0) => { return "unknown"; }
+            return cgStaticKind(st, at(args, 0), env, seen);
+        }
+        let fn = cgMapFind(cgFuncs(st), callee);
+        if (fn != null) => {
+            let r = cgFunctionReturnKind(st, fn);
+            return at(r, 0);
+        }
+        return "null";
+    }
+    return "unknown";
+)
+
+// --- Param kinds / string-position analysis -----------------------------
+
+func cgContainsName(expr, name) => (
+    let tag = at(expr, 0);
+    if (tag == "Identifier") => { return at(expr, 1) == name; }
+    if (tag == "IntLiteral") => { return false; }
+    if (tag == "StringLiteral") => { return false; }
+    if (tag == "BoolLiteral") => { return false; }
+    if (tag == "NullLiteral") => { return false; }
+    if (tag == "ListLiteral") => {
+        let elems = at(expr, 1);
+        let i = 0;
+        while (i < length(elems)) => {
+            if (cgContainsName(at(elems, i), name)) => { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (tag == "Unary") => { return cgContainsName(at(expr, 2), name); }
+    if (tag == "Binary") => {
+        return cgContainsName(at(expr, 1), name) || cgContainsName(at(expr, 3), name);
+    }
+    if (tag == "Conditional") => {
+        return cgContainsName(at(expr, 1), name)
+            || cgContainsName(at(expr, 2), name)
+            || cgContainsName(at(expr, 3), name);
+    }
+    if (tag == "Call") => {
+        let args = at(expr, 2);
+        let i = 0;
+        while (i < length(args)) => {
+            if (cgContainsName(at(args, i), name)) => { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    return false;
+)
+
+func cgIsStringSafe(expr, env) => (
+    let tag = at(expr, 0);
+    if (tag == "StringLiteral") => { return true; }
+    if (tag == "Identifier") => { return cgEnvGet(env, at(expr, 1)) == "string"; }
+    if (tag == "IntLiteral") => { return false; }
+    if (tag == "BoolLiteral") => { return false; }
+    if (tag == "NullLiteral") => { return false; }
+    if (tag == "ListLiteral") => { return false; }
+    if (tag == "Unary") => { return cgIsStringSafe(at(expr, 2), env); }
+    if (tag == "Binary") => {
+        return at(expr, 2) == "+"
+            && (cgIsStringSafe(at(expr, 1), env) || cgIsStringSafe(at(expr, 3), env));
+    }
+    if (tag == "Conditional") => {
+        return cgIsStringSafe(at(expr, 2), env) && cgIsStringSafe(at(expr, 3), env);
+    }
+    if (tag == "Call") => { return cgIsStringProducing(at(expr, 1)); }
+    return false;
+)
+
+func cgExprUsesAsString(st, expr, name, env) => (
+    let tag = at(expr, 0);
+    if (tag == "Identifier") => { return [false, st]; }
+    if (tag == "IntLiteral") => { return [false, st]; }
+    if (tag == "StringLiteral") => { return [false, st]; }
+    if (tag == "BoolLiteral") => { return [false, st]; }
+    if (tag == "NullLiteral") => { return [false, st]; }
+    if (tag == "ListLiteral") => { return [false, st]; }
+    if (tag == "Unary") => {
+        return cgExprUsesAsString(st, at(expr, 2), name, env);
+    }
+    if (tag == "Binary") => {
+        let op = at(expr, 2);
+        if (op == "+" || op == "==" || op == "!=" || op == "<" || op == "<="
+            || op == ">" || op == ">=") => {
+            if (cgContainsName(at(expr, 1), name) && cgIsStringSafe(at(expr, 3), env)) => {
+                return [true, st];
+            }
+            if (cgContainsName(at(expr, 3), name) && cgIsStringSafe(at(expr, 1), env)) => {
+                return [true, st];
+            }
+            return [false, st];
+        }
+        return [false, st];
+    }
+    if (tag == "Conditional") => {
+        if (cgContainsName(at(expr, 2), name) && cgIsStringSafe(at(expr, 3), env)) => {
+            return [true, st];
+        }
+        if (cgContainsName(at(expr, 3), name) && cgIsStringSafe(at(expr, 2), env)) => {
+            return [true, st];
+        }
+        return cgExprUsesAsString(st, at(expr, 1), name, env);
+    }
+    if (tag == "Call") => {
+        let callee = at(expr, 1);
+        let args = at(expr, 2);
+        if (cgIsStringSubject(callee)) => {
+            if (length(args) == 0) => { return [false, st]; }
+            if (cgContainsName(at(args, 0), name)) => { return [true, st]; }
+            if ((callee == "contains" || callee == "indexOf") && length(args) > 1) => {
+                if (cgContainsName(at(args, 1), name)) => { return [true, st]; }
+            }
+            return [false, st];
+        }
+        let fn = cgMapFind(cgFuncs(st), callee);
+        if (fn != null) => {
+            let kr = cgFunctionParamKinds(st, fn);
+            let kinds = at(kr, 0);
+            let i = 0;
+            while (i < length(kinds) && i < length(args)) => {
+                if (at(kinds, i) == "string" && cgContainsName(at(args, i), name)) => {
+                    return [true, at(kr, 1)];
+                }
+                i = i + 1;
+            }
+            return [false, at(kr, 1)];
+        }
+        return [false, st];
+    }
+    return [false, st];
+)
+
+func cgBodyUsesAsString(st, statements, name, env) => (
+    let i = 0;
+    while (i < length(statements)) => {
+        let statement = at(statements, i);
+        let tag = at(statement, 0);
+        if (tag == "LetStmt") => {
+            let r = cgExprUsesAsString(st, at(statement, 2), name, env);
+            if (at(r, 0)) => { return [true, at(r, 1)]; }
+            st = at(r, 1);
+        }
+        if (tag == "AssignStmt") => {
+            let r = cgExprUsesAsString(st, at(statement, 2), name, env);
+            if (at(r, 0)) => { return [true, at(r, 1)]; }
+            st = at(r, 1);
+        }
+        if (tag == "ReturnStmt") => {
+            let r = cgExprUsesAsString(st, at(statement, 1), name, env);
+            if (at(r, 0)) => { return [true, at(r, 1)]; }
+            st = at(r, 1);
+        }
+        if (tag == "ExprStmt") => {
+            let r = cgExprUsesAsString(st, at(statement, 1), name, env);
+            if (at(r, 0)) => { return [true, at(r, 1)]; }
+            st = at(r, 1);
+        }
+        if (tag == "IfStmt") => {
+            let r = cgExprUsesAsString(st, at(statement, 1), name, env);
+            if (at(r, 0)) => { return [true, at(r, 1)]; }
+            st = at(r, 1);
+            let br = cgBodyUsesAsString(st, at(statement, 2), name, env);
+            if (at(br, 0)) => { return [true, at(br, 1)]; }
+            st = at(br, 1);
+            let elseB = cgFlattenElse(at(statement, 3));
+            if (elseB != null) => {
+                let er = cgBodyUsesAsString(st, elseB, name, env);
+                if (at(er, 0)) => { return [true, at(er, 1)]; }
+                st = at(er, 1);
+            }
+        }
+        if (tag == "WhileStmt") => {
+            let r = cgExprUsesAsString(st, at(statement, 1), name, env);
+            if (at(r, 0)) => { return [true, at(r, 1)]; }
+            st = at(r, 1);
+            let br = cgBodyUsesAsString(st, at(statement, 2), name, env);
+            if (at(br, 0)) => { return [true, at(br, 1)]; }
+            st = at(br, 1);
+        }
+        if (tag == "ForStmt") => {
+            let init = at(statement, 1);
+            let r = cgExprUsesAsString(st, at(init, 2), name, env);
+            if (at(r, 0)) => { return [true, at(r, 1)]; }
+            st = at(r, 1);
+            let c = cgExprUsesAsString(st, at(statement, 2), name, env);
+            if (at(c, 0)) => { return [true, at(c, 1)]; }
+            st = at(c, 1);
+            let br = cgBodyUsesAsString(st, at(statement, 4), name, env);
+            if (at(br, 0)) => { return [true, at(br, 1)]; }
+            st = at(br, 1);
+        }
+        i = i + 1;
+    }
+    return [false, st];
+)
+
+func cgFunctionParamKinds(st, function) => (
+    let name = at(function, 1);
+    if (cgMapHas(cgPCache(st), name)) => {
+        return [cgMapFind(cgPCache(st), name), st];
+    }
+    let params = at(function, 2);
+    let n = length(params);
+    let kinds = cgWordKinds(n);
+    let st1 = cgSetPCache(st, cgMapSet(cgPCache(st), name, cgListCopy(kinds)));
+    let changed = true;
+    while (changed) => {
+        let env = [];
+        let i = 0;
+        while (i < n) => {
+            env = append(env, [at(params, i), at(kinds, i)]);
+            i = i + 1;
+        }
+        changed = false;
+        i = 0;
+        while (i < n) => {
+            if (at(kinds, i) != "string") => {
+                let r = cgBodyUsesAsString(st1, at(function, 3), at(params, i), env);
+                if (at(r, 0)) => {
+                    kinds = cgSetListAt(kinds, i, "string");
+                    env = cgEnvSet(env, at(params, i), "string");
+                    changed = true;
+                }
+                st1 = at(r, 1);
+            }
+            i = i + 1;
+        }
+        st1 = cgSetPCache(st1, cgMapSet(cgPCache(st1), name, cgListCopy(kinds)));
+    }
+    return [kinds, st1];
+)
+
+// An if/else "else" value is either an IfStmt node, a list of statements, or
+// null. A node's first element is a tag string; a statement list's first
+// element is a nested node (a list). Normalise to a statement list.
+
+func cgFlattenElse(elseB) => (
+    if (elseB != null && cgIsList(elseB) && length(elseB) > 0) => {
+        if (cgIsList(at(elseB, 0)) == false) => { return [elseB]; }
+    }
+    return elseB;
+)
+
+func cgFunctionReturnKind(st, function) => (
+    let name = at(function, 1);
+    if (cgMapHas(cgRCache(st), name)) => {
+        return [cgMapFind(cgRCache(st), name), st];
+    }
+    let st1 = cgSetRCache(st, cgMapSet(cgRCache(st), name, "unknown"));
+    let kr = cgFunctionParamKinds(st1, function);
+    let params = at(function, 2);
+    let kinds = at(kr, 0);
+    let env = [];
+    let i = 0;
+    while (i < length(params)) => {
+        env = append(env, [at(params, i), at(kinds, i)]);
+        i = i + 1;
+    }
+    let res = cgAnalyzeFunctionTypes(at(kr, 1), at(function, 3), env);
+    let final = at(res, 1);
+    let st2 = cgSetRCache(at(res, 2), cgMapSet(cgRCache(at(res, 2)), name, final));
+    return [final, st2];
+)
+
+func cgAnalyzeFunctionTypes(st, statements, env) => (
+    let slots = 0;
+    let final = null;
+    let i = 0;
+    while (i < length(statements)) => {
+        let statement = at(statements, i);
+        let tag = at(statement, 0);
+        if (tag == "LetStmt") => {
+            let kind = cgStaticKind(st, at(statement, 2), env, []);
+            env = cgEnvSet(env, at(statement, 1), kind);
+            slots = slots + cgWidth(kind);
+        }
+        if (tag == "AssignStmt") => {
+            if (cgMapHas(env, at(statement, 1))) => {
+                env = cgEnvSet(env, at(statement, 1),
+                    cgStaticKind(st, at(statement, 2), env, []));
+            }
+        }
+        if (tag == "ExprStmt") => {
+            final = cgStaticKind(st, at(statement, 1), env, []);
+        }
+        if (tag == "ReturnStmt") => {
+            final = cgStaticKind(st, at(statement, 1), env, []);
+        }
+        if (tag == "IfStmt") => {
+            let thenRes = cgAnalyzeFunctionTypes(st, at(statement, 2), cgEnvCopy(env));
+            slots = slots + at(thenRes, 0);
+            let elseRes = [0, null, at(thenRes, 2)];
+            let elseB = cgFlattenElse(at(statement, 3));
+            if (elseB == null) => {
+                elseRes = [0, null, at(thenRes, 2)];
+            }
+            else => {
+                elseRes = cgAnalyzeFunctionTypes(at(thenRes, 2), elseB, cgEnvCopy(env));
+            }
+            slots = slots + at(elseRes, 0);
+            let thenFinal = at(thenRes, 1);
+            let elseFinal = at(elseRes, 1);
+            if (thenFinal != null && thenFinal == elseFinal) => {
+                final = thenFinal;
+            }
+            st = at(elseRes, 2);
+        }
+        if (tag == "WhileStmt") => {
+            let bodyRes = cgAnalyzeFunctionTypes(st, at(statement, 2), cgEnvCopy(env));
+            slots = slots + at(bodyRes, 0);
+            if (final == null) => { final = at(bodyRes, 1); }
+            st = at(bodyRes, 2);
+        }
+        if (tag == "ForStmt") => {
+            let init = at(statement, 1);
+            let kind = cgStaticKind(st, at(init, 2), env, []);
+            slots = slots + cgWidth(kind);
+            env = cgEnvSet(env, at(init, 1), kind);
+            let bodyRes = cgAnalyzeFunctionTypes(st, at(statement, 4), cgEnvCopy(env));
+            slots = slots + at(bodyRes, 0);
+            if (final == null) => { final = at(bodyRes, 1); }
+            st = at(bodyRes, 2);
+        }
+        i = i + 1;
+    }
+    return [slots, final, st];
+)
+
+func cgValidateInitializer(st, expr) => (
+    let tag = at(expr, 0);
+    if (tag == "Identifier") => {
+        let name = at(expr, 1);
+        if (cgMapHas(cgOff(st), name)) => { return st; }
+        if (!cgMapHas(cgVars(st), name)) => {
+            return cgFail(st, "undefined variable '" + name + "'");
+        }
+        return st;
+    }
+    if (tag == "Unary") => { return cgValidateInitializer(st, at(expr, 2)); }
+    if (tag == "Binary") => {
+        let left = at(expr, 1);
+        let op = at(expr, 2);
+        let right = at(expr, 3);
+        let st1 = cgValidateInitializer(st, left);
+        if (cgFailed(st1)) => { return st1; }
+        let lv = cgConstantValue(st1, left);
+        if (cgFailed(at(lv, 1))) => { return at(lv, 1); }
+        if (op == "&&") => {
+            if (!cgTruthy(at(lv, 0))) => { return st1; }
+            return cgValidateInitializer(st1, right);
+        }
+        if (op == "||") => {
+            if (cgTruthy(at(lv, 0))) => { return st1; }
+            return cgValidateInitializer(st1, right);
+        }
+        return cgValidateInitializer(st1, right);
+    }
+    if (tag == "Call") => {
+        let args = at(expr, 2);
+        let i = 0;
+        while (i < length(args)) => {
+            let st1 = cgValidateInitializer(st, at(args, i));
+            if (cgFailed(st1)) => { return st1; }
+            st = st1;
+            i = i + 1;
+        }
+        return st;
+    }
+    if (tag == "Conditional") => {
+        let cond = at(expr, 1);
+        let stc = cgValidateInitializer(st, cond);
+        if (cgFailed(stc)) => { return stc; }
+        let cv = cgConstantValue(stc, cond);
+        if (cgFailed(at(cv, 1))) => { return at(cv, 1); }
+        if (cgTruthy(at(cv, 0))) => { return cgValidateInitializer(at(cv, 1), at(expr, 2)); }
+        return cgValidateInitializer(at(cv, 1), at(expr, 3));
+    }
+    return st;
+)
+
+// --- Main-level statement compilation ------------------------------------
+
+func cgAddRuntimeVar(st, name, kind) => (
+    let offset = 16 + 8 * cgNext(st);
+    let st1 = cgSetOff(st, cgMapSet(cgOff(st), name, offset));
+    let st2 = cgSetTypes(st1, cgMapSet(cgTypes(st1), name, kind));
+    return cgSetNext(st2, cgNext(st2) + cgWidth(kind));
+)
+
+func cgStoreVarLines(st, name) => (
+    let offset = cgMapFind(cgOff(st), name);
+    if (cgMapFind(cgTypes(st), name) == "string") => {
+        return ["    str x0, [x29, #" + toString(offset) + "]",
+                "    str x1, [x29, #" + toString(offset + 8) + "]"];
+    }
+    return ["    str x0, [x29, #" + toString(offset) + "]"];
+)
+
+func cgLoadVarLines(st, name) => (
+    let offset = cgMapFind(cgOff(st), name);
+    if (cgMapFind(cgTypes(st), name) == "string") => {
+        return ["    ldr x0, [x29, #" + toString(offset) + "]",
+                "    ldr x1, [x29, #" + toString(offset + 8) + "]"];
+    }
+    return ["    ldr x0, [x29, #" + toString(offset) + "]"];
+)
+
+func cgApplyIncrement(st, name) => (
+    if (!cgMapHas(cgVars(st), name)) => {
+        return cgFail(st, "undefined variable '" + name + "'");
+    }
+    let r = cgConstantValue(st, cgMapFind(cgVars(st), name));
+    let current = at(r, 0);
+    if (cgIsBool(current) || cgIsStr(current) || cgIsNull(current) || cgIsList(current)) => {
+        return cgFail(st, "cannot increment non-integer variable '" + name + "'");
+    }
+    return cgSetVars(at(r, 1), cgMapSet(cgVars(at(r, 1)), name,
+        ["IntLiteral", current + 1]));
+)
+
+func cgCompileWhile(st, statement) => (
+    let body = [];
+    let iterations = 0;
+    let st1 = st;
+    let c = cgConstantValue(st1, at(statement, 1));
+    st1 = at(c, 1);
+    while (cgTruthy(at(c, 0))) => {
+        if (iterations >= 1000000) => {
+            return [[], cgFail(st1, "while loop does not terminate at compile time")];
+        }
+        let br = cgCompileStatements(st1, at(statement, 2), true);
+        if (cgFailed(at(br, 1))) => { return [[], at(br, 1)]; }
+        body = concat(body, at(br, 0));
+        st1 = at(br, 1);
+        iterations = iterations + 1;
+        c = cgConstantValue(st1, at(statement, 1));
+        st1 = at(c, 1);
+    }
+    return [body, st1];
+)
+
+func cgCompileFor(st, statement) => (
+    let saved = cgListCopy(cgVars(st));
+    let ires = cgCompileStatements(st, [at(statement, 1)], false);
+    if (cgFailed(at(ires, 1))) => { return [[], at(ires, 1)]; }
+    let body = cgListCopy(at(ires, 0));
+    let st1 = at(ires, 1);
+    let iterations = 0;
+    let c = cgConstantValue(st1, at(statement, 2));
+    st1 = at(c, 1);
+    while (cgTruthy(at(c, 0))) => {
+        if (iterations >= 1000000) => {
+            return [[], cgFail(st1, "for loop does not terminate at compile time")];
+        }
+        let br = cgCompileStatements(st1, at(statement, 4), true);
+        if (cgFailed(at(br, 1))) => { return [[], at(br, 1)]; }
+        body = concat(body, at(br, 0));
+        st1 = at(br, 1);
+        st1 = cgApplyIncrement(st1, at(at(statement, 3), 1));
+        if (cgFailed(st1)) => { return [[], st1]; }
+        iterations = iterations + 1;
+        c = cgConstantValue(st1, at(statement, 2));
+        st1 = at(c, 1);
+    }
+    let i = 0;
+    while (i < length(saved)) => {
+        let name = at(at(saved, i), 0);
+        if (cgMapHas(cgVars(st1), name)) => {
+            saved = cgMapSet(saved, name, cgMapFind(cgVars(st1), name));
+        }
+        i = i + 1;
+    }
+    return [body, cgSetVars(st1, saved)];
+)
+
+func cgCompileStatements(st, statements, scoped) => (
+    if (cgFailed(st)) => { return [[], st]; }
+    let saved = [];
+    if (scoped) => { saved = cgListCopy(cgVars(st)); }
+    let body = [];
+    let st1 = st;
+    let i = 0;
+    while (i < length(statements)) => {
+        if (cgFailed(st1)) => { return [[], st1]; }
+        let statement = at(statements, i);
+        let tag = at(statement, 0);
+        if (tag == "LetStmt") => {
+            let name = at(statement, 1);
+            if (cgMapHas(cgVars(st1), name) || cgMapHas(cgOff(st1), name)) => {
+                return [[], cgFail(st1, "variable '" + name + "' is already declared")];
+            }
+            let init = at(statement, 2);
+            if (cgContainsRuntimeValue(st1, init)) => {
+                if (scoped) => {
+                    return [[], cgFail(st1,
+                        "let with a user-defined function call inside a block is not yet supported")];
+                }
+                let kind = cgStaticKind(st1, init, cgCurrentEnv(st1), []);
+                let st2 = cgAddRuntimeVar(st1, name, kind);
+                let rc = cgRuntimeExpr(st2, init, cgCurrentEnv(st2));
+                if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+                body = concat(body, at(rc, 0));
+                st1 = at(rc, 1);
+                body = concat(body, cgStoreVarLines(st1, name));
+            }
+            else => {
+                let stv = cgValidateInitializer(st1, init);
+                if (cgFailed(stv)) => { return [[], stv]; }
+                st1 = cgSetVars(stv, cgMapSet(cgVars(stv), name, init));
+            }
+        }
+        if (tag == "AssignStmt") => {
+            let name = at(statement, 1);
+            if (cgMapHas(cgOff(st1), name)) => {
+                let rc = cgRuntimeExpr(st1, at(statement, 2), []);
+                if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+                body = concat(body, at(rc, 0));
+                st1 = at(rc, 1);
+                body = concat(body, cgStoreVarLines(st1, name));
+            }
+            else => {
+                if (cgMapHas(cgVars(st1), name)) => {
+                    let kind = cgStaticKind(st1, at(statement, 2), [], []);
+                    let previous = cgMapFind(cgVars(st1), name);
+                    let st2 = cgAddRuntimeVar(st1, name, kind);
+                    let st3 = cgRemoveVar(st2, name);
+                    let rp = cgRuntimeExpr(st3, previous, []);
+                    if (cgFailed(at(rp, 1))) => { return [[], at(rp, 1)]; }
+                    body = concat(body, at(rp, 0));
+                    st3 = at(rp, 1);
+                    body = concat(body, cgStoreVarLines(st3, name));
+                    let rv = cgRuntimeExpr(st3, at(statement, 2), []);
+                    if (cgFailed(at(rv, 1))) => { return [[], at(rv, 1)]; }
+                    body = concat(body, at(rv, 0));
+                    st3 = at(rv, 1);
+                    body = concat(body, cgStoreVarLines(st3, name));
+                    st1 = st3;
+                }
+                else => {
+                    return [[], cgFail(st1, "undefined variable '" + name + "'")];
+                }
+            }
+        }
+        if (tag == "IfStmt") => {
+            let cv = cgConstantValue(st1, at(statement, 1));
+            if (cgFailed(at(cv, 1))) => { return [[], at(cv, 1)]; }
+            let branch = null;
+            if (cgTruthy(at(cv, 0))) => { branch = at(statement, 2); }
+            else => { branch = at(statement, 3); }
+            if (branch != null) => {
+                let br = cgFlattenElse(branch);
+                let rb = cgCompileStatements(at(cv, 1), br, true);
+                if (cgFailed(at(rb, 1))) => { return [[], at(rb, 1)]; }
+                body = concat(body, at(rb, 0));
+                st1 = at(rb, 1);
+            }
+            else => { st1 = at(cv, 1); }
+        }
+        if (tag == "WhileStmt") => {
+            let rw = cgCompileWhile(st1, statement);
+            if (cgFailed(at(rw, 1))) => { return [[], at(rw, 1)]; }
+            body = concat(body, at(rw, 0));
+            st1 = at(rw, 1);
+        }
+        if (tag == "ForStmt") => {
+            let rf = cgCompileFor(st1, statement);
+            if (cgFailed(at(rf, 1))) => { return [[], at(rf, 1)]; }
+            body = concat(body, at(rf, 0));
+            st1 = at(rf, 1);
+        }
+        if (tag == "IncrementStmt") => {
+            st1 = cgApplyIncrement(st1, at(statement, 1));
+            if (cgFailed(st1)) => { return [[], st1]; }
+        }
+        if (tag == "ReturnStmt") => {
+            if (cgRetlbl(st1) == null) => {
+                return [[], cgFail(st1, "'return' is only allowed inside a function")];
+            }
+            let re = cgExpression(st1, at(statement, 1));
+            if (cgFailed(at(re, 1))) => { return [[], at(re, 1)]; }
+            body = concat(body, at(re, 0));
+            st1 = at(re, 1);
+            body = append(body, "    b " + cgRetlbl(st1));
+        }
+        if (tag == "ExprStmt") => {
+            let rs = cgStatement(st1, at(statement, 1));
+            if (cgFailed(at(rs, 1))) => { return [[], at(rs, 1)]; }
+            body = concat(body, at(rs, 0));
+            st1 = at(rs, 1);
+        }
+        i = i + 1;
+    }
+    if (scoped) => {
+        let i2 = 0;
+        while (i2 < length(saved)) => {
+            let name = at(at(saved, i2), 0);
+            if (cgMapHas(cgVars(st1), name)) => {
+                saved = cgMapSet(saved, name, cgMapFind(cgVars(st1), name));
+            }
+            i2 = i2 + 1;
+        }
+        st1 = cgSetVars(st1, saved);
+    }
+    return [body, st1];
+)
+
+func cgRemoveVar(st, name) => (
+    let out = [];
+    let i = 0;
+    while (i < length(cgVars(st))) => {
+        if (at(at(cgVars(st), i), 0) != name) => {
+            out = append(out, at(cgVars(st), i));
+        }
+        i = i + 1;
+    }
+    return cgSetVars(st, out);
+)
+
+func cgPlanFunctionBody(st, statements, env) => (
+    let st1 = st;
+    let i = 0;
+    while (i < length(statements)) => {
+        let statement = at(statements, i);
+        let tag = at(statement, 0);
+        if (tag == "LetStmt") => {
+            let name = at(statement, 1);
+            let kind = cgStaticKind(st1, at(statement, 2), env, []);
+            let offset = 16 + 8 * cgNext(st1);
+            st1 = cgSetOff(st1, cgMapSet(cgOff(st1), name, offset));
+            st1 = cgSetTypes(st1, cgMapSet(cgTypes(st1), name, kind));
+            env = cgEnvSet(env, name, kind);
+            st1 = cgSetNext(st1, cgNext(st1) + cgWidth(kind));
+        }
+        if (tag == "AssignStmt") => {
+            if (cgMapHas(env, at(statement, 1))) => {
+                env = cgEnvSet(env, at(statement, 1),
+                    cgStaticKind(st1, at(statement, 2), env, []));
+            }
+        }
+        if (tag == "IfStmt") => {
+            st1 = cgPlanFunctionBody(st1, at(statement, 2), env);
+            let elseB = cgFlattenElse(at(statement, 3));
+            if (elseB != null) => { st1 = cgPlanFunctionBody(st1, elseB, env); }
+        }
+        if (tag == "WhileStmt") => {
+            st1 = cgPlanFunctionBody(st1, at(statement, 2), env);
+        }
+        if (tag == "ForStmt") => {
+            let init = at(statement, 1);
+            let name = at(init, 1);
+            if (!cgMapHas(cgOff(st1), name)) => {
+                let kind = cgStaticKind(st1, at(init, 2), env, []);
+                let offset = 16 + 8 * cgNext(st1);
+                st1 = cgSetOff(st1, cgMapSet(cgOff(st1), name, offset));
+                st1 = cgSetTypes(st1, cgMapSet(cgTypes(st1), name, kind));
+                env = cgEnvSet(env, name, kind);
+                st1 = cgSetNext(st1, cgNext(st1) + cgWidth(kind));
+            }
+            st1 = cgPlanFunctionBody(st1, at(statement, 4), env);
+        }
+        i = i + 1;
+    }
+    return st1;
+)
+
+func cgCountRuntimeLets(st, statements) => (
+    let count = 0;
+    let i = 0;
+    while (i < length(statements)) => {
+        let statement = at(statements, i);
+        let tag = at(statement, 0);
+        if (tag == "LetStmt") => {
+            if (cgContainsRuntimeValue(st, at(statement, 2))) => {
+                count = count + cgWidth(
+                    cgStaticKind(st, at(statement, 2), cgCurrentEnv(st), []));
+            }
+        }
+        if (tag == "AssignStmt") => {
+            if (cgMapHas(cgVars(st), at(statement, 1))
+                && cgContainsRuntimeValue(st, at(statement, 2))) => {
+                count = count + cgWidth(
+                    cgStaticKind(st, at(statement, 2), cgCurrentEnv(st), []));
+            }
+        }
+        if (tag == "IfStmt") => {
+            count = count + cgCountRuntimeLets(st, at(statement, 2));
+            let elseB = cgFlattenElse(at(statement, 3));
+            if (elseB != null) => {
+                count = count + cgCountRuntimeLets(st, elseB);
+            }
+        }
+        if (tag == "WhileStmt") => {
+            count = count + cgCountRuntimeLets(st, at(statement, 2));
+        }
+        if (tag == "ForStmt") => {
+            count = count + cgCountRuntimeLets(st, [at(statement, 1)]);
+            count = count + cgCountRuntimeLets(st, at(statement, 4));
+        }
+        i = i + 1;
+    }
+    return count;
+)
+
+func cgCompileUserFunction(st, function) => (
+    let name = at(function, 1);
+    let kr = cgFunctionParamKinds(st, function);
+    let kinds = at(kr, 0);
+    let st1 = at(kr, 1);
+    let params = at(function, 2);
+    let savedOff = cgOff(st1);
+    let savedTypes = cgTypes(st1);
+    let savedNext = cgNext(st1);
+    let savedVars = cgVars(st1);
+    let st2 = cgSetNext(cgSetTypes(cgSetOff(cgSetVars(st1, []), []), []), 0);
+    let env = [];
+    let paramOffsets = [];
+    let slot = 0;
+    let i = 0;
+    while (i < length(params)) => {
+        let param = at(params, i);
+        let kind = at(kinds, i);
+        let offset = 16 + 8 * slot;
+        st2 = cgSetOff(st2, cgMapSet(cgOff(st2), param, offset));
+        st2 = cgSetTypes(st2, cgMapSet(cgTypes(st2), param, kind));
+        env = append(env, [param, kind]);
+        paramOffsets = append(paramOffsets, [param, kind, offset]);
+        slot = slot + cgWidth(kind);
+        i = i + 1;
+    }
+    st2 = cgSetNext(st2, slot);
+    let st3 = cgPlanFunctionBody(st2, at(function, 3), env);
+    let frame = cgAlign16(16 + 8 * cgNext(st3));
+    let exitLabel = "L_function_return_" + toString(cgLabel(st3));
+    let st4 = cgSetLabel(st3, cgLabel(st3) + 1);
+    let savedRet = cgRetlbl(st4);
+    let st5 = cgSetRetlbl(st4, exitLabel);
+    let lines = ["_serenity_" + name + ":"];
+    lines = append(lines, "    stp x29, x30, [sp, #-" + toString(frame) + "]!");
+    lines = append(lines, "    mov x29, sp");
+    i = 0;
+    while (i < length(paramOffsets)) => {
+        let tk = at(paramOffsets, i);
+        let kind = at(tk, 1);
+        let offset = at(tk, 2);
+        let reg = (offset - 16) / 8;
+        if (kind == "string") => {
+            lines = append(lines, "    str x" + toString(reg)
+                + ", [x29, #" + toString(offset) + "]");
+            lines = append(lines, "    str x" + toString(reg + 1)
+                + ", [x29, #" + toString(offset + 8) + "]");
+        }
+        else => {
+            lines = append(lines, "    str x" + toString(reg)
+                + ", [x29, #" + toString(offset) + "]");
+        }
+        i = i + 1;
+    }
+    let rs = cgCompileRuntimeStatements(st5, at(function, 3));
+    if (cgFailed(at(rs, 1))) => { return [[], at(rs, 1)]; }
+    lines = concat(lines, at(rs, 0));
+    lines = append(lines, exitLabel + ":");
+    lines = append(lines, "    ldp x29, x30, [sp], #" + toString(frame));
+    lines = append(lines, "    ret");
+    let stf = at(rs, 1);
+    stf = cgSetNext(cgSetTypes(cgSetOff(cgSetVars(stf, savedVars), savedOff), savedTypes), savedNext);
+    stf = cgSetRetlbl(stf, savedRet);
+    return [lines, stf];
+)
+
+// --- Runtime (user-function) compilation --------------------------------
+
+func cgCompileRuntimeStatements(st, statements) => (
+    if (cgFailed(st)) => { return [[], st]; }
+    let lines = [];
+    let st1 = st;
+    let i = 0;
+    while (i < length(statements)) => {
+        if (cgFailed(st1)) => { return [[], st1]; }
+        let statement = at(statements, i);
+        let tag = at(statement, 0);
+        if (tag == "LetStmt") => {
+            let name = at(statement, 1);
+            if (!cgMapHas(cgOff(st1), name)) => {
+                let kind = cgStaticKind(st1, at(statement, 2), cgCurrentEnv(st1), []);
+                st1 = cgAddRuntimeVar(st1, name, kind);
+            }
+            let rc = cgRuntimeExpr(st1, at(statement, 2), []);
+            if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+            lines = concat(lines, at(rc, 0));
+            st1 = at(rc, 1);
+            lines = concat(lines, cgStoreVarLines(st1, name));
+        }
+        if (tag == "AssignStmt") => {
+            let name = at(statement, 1);
+            if (!cgMapHas(cgOff(st1), name)) => {
+                return [[], cgFail(st1, "undefined variable '" + name + "'")];
+            }
+            let rc = cgRuntimeExpr(st1, at(statement, 2), []);
+            if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+            lines = concat(lines, at(rc, 0));
+            st1 = at(rc, 1);
+            lines = concat(lines, cgStoreVarLines(st1, name));
+        }
+        if (tag == "IfStmt") => {
+            let ri = cgCompileRuntimeIf(st1, statement);
+            if (cgFailed(at(ri, 1))) => { return [[], at(ri, 1)]; }
+            lines = concat(lines, at(ri, 0));
+            st1 = at(ri, 1);
+        }
+        if (tag == "WhileStmt") => {
+            let rw = cgCompileRuntimeWhile(st1, statement);
+            if (cgFailed(at(rw, 1))) => { return [[], at(rw, 1)]; }
+            lines = concat(lines, at(rw, 0));
+            st1 = at(rw, 1);
+        }
+        if (tag == "ForStmt") => {
+            let rf = cgCompileRuntimeFor(st1, statement);
+            if (cgFailed(at(rf, 1))) => { return [[], at(rf, 1)]; }
+            lines = concat(lines, at(rf, 0));
+            st1 = at(rf, 1);
+        }
+        if (tag == "IncrementStmt") => {
+            let ri = cgCompileRuntimeIncrement(st1, statement);
+            if (cgFailed(at(ri, 1))) => { return [[], at(ri, 1)]; }
+            lines = concat(lines, at(ri, 0));
+            st1 = at(ri, 1);
+        }
+        if (tag == "ReturnStmt") => {
+            if (cgRetlbl(st1) == null) => {
+                return [[], cgFail(st1, "'return' is only allowed inside a function")];
+            }
+            let re = cgRuntimeExpr(st1, at(statement, 1), []);
+            if (cgFailed(at(re, 1))) => { return [[], at(re, 1)]; }
+            lines = concat(lines, at(re, 0));
+            st1 = at(re, 1);
+            lines = append(lines, "    b " + cgRetlbl(st1));
+        }
+        if (tag == "ExprStmt") => {
+            let re = cgRuntimeExpr(st1, at(statement, 1), []);
+            if (cgFailed(at(re, 1))) => { return [[], at(re, 1)]; }
+            lines = concat(lines, at(re, 0));
+            st1 = at(re, 1);
+        }
+        i = i + 1;
+    }
+    return [lines, st1];
+)
+
+func cgCompileRuntimeIncrement(st, statement) => (
+    let name = at(statement, 1);
+    if (!cgMapHas(cgOff(st), name)) => {
+        return [[], cgFail(st, "undefined variable '" + name + "'")];
+    }
+    let offset = cgMapFind(cgOff(st), name);
+    return [["    ldr x0, [x29, #" + toString(offset) + "]",
+             "    add x0, x0, #1",
+             "    str x0, [x29, #" + toString(offset) + "]"], st];
+)
+
+func cgCompileRuntimeConditional(st, expression, env) => (
+    let falseLabel = "L_cond_false_" + toString(cgLabel(st));
+    let endLabel = "L_cond_end_" + toString(cgLabel(st));
+    let st1 = cgSetLabel(st, cgLabel(st) + 1);
+    let rc = cgCompileRuntimeCondition(st1, at(expression, 1), env);
+    if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+    let lines = at(rc, 0);
+    lines = concat(lines, ["    cmp x0, #0", "    b.eq " + falseLabel]);
+    let rt = cgRuntimeExpr(at(rc, 1), at(expression, 2), env);
+    if (cgFailed(at(rt, 1))) => { return [[], at(rt, 1)]; }
+    lines = concat(lines, at(rt, 0));
+    lines = concat(lines, ["    b " + endLabel, falseLabel + ":"]);
+    let rf = cgRuntimeExpr(at(rt, 1), at(expression, 3), env);
+    if (cgFailed(at(rf, 1))) => { return [[], at(rf, 1)]; }
+    lines = concat(lines, at(rf, 0));
+    lines = append(lines, endLabel + ":");
+    return [lines, at(rf, 1)];
+)
+
+func cgCompileRuntimeCondition(st, expression, env) => (
+    let rc = cgRuntimeExpr(st, expression, env);
+    if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+    let lines = at(rc, 0);
+    if (cgStaticKind(st, expression, env, []) == "string") => {
+        lines = append(lines, "    mov x0, x1");
+    }
+    return [lines, at(rc, 1)];
+)
+
+func cgMovTruthy(v) => (
+    if (cgTruthy(v)) => { return "    mov x0, #1"; }
+    return "    mov x0, #0";
+)
+
+func cgMovBool(v) => (
+    if (v == true) => { return "    mov x0, #1"; }
+    return "    mov x0, #0";
+)
+
+func cgRuntimeExpr(st, expr, env) => (
+    if (cgFailed(st)) => { return [[], st]; }
+    let tag = at(expr, 0);
+    if (tag == "IntLiteral") => { return [["    mov x0, #" + toString(at(expr, 1))], st]; }
+    if (tag == "BoolLiteral") => { return [[cgMovBool(at(expr, 1))], st]; }
+    if (tag == "NullLiteral") => { return [["    mov x0, #0"], st]; }
+    if (tag == "ListLiteral") => {
+        return [[], cgFail(st, "lists are only supported at compile time")];
+    }
+    if (tag == "StringLiteral") => {
+        let ns = cgNewString(st, at(expr, 1));
+        return [["    adrp x0, " + at(ns, 0) + "@PAGE",
+                 "    add x0, x0, " + at(ns, 0) + "@PAGEOFF",
+                 "    mov x1, #" + toString(at(ns, 1))], at(ns, 2)];
+    }
+    if (tag == "Identifier") => {
+        let name = at(expr, 1);
+        if (cgMapHas(cgOff(st), name)) => {
+            if (cgMapFind(cgTypes(st), name) == "string") => {
+                return [cgLoadVarLines(st, name), st];
+            }
+            return [["    ldr x0, [x29, #"
+                + toString(cgMapFind(cgOff(st), name)) + "]"], st];
+        }
+        if (cgMapHas(cgVars(st), name)) => {
+            return cgRuntimeExpr(st, cgMapFind(cgVars(st), name), env);
+        }
+        return [[], cgFail(st, "undefined variable '" + name + "'")];
+    }
+    if (tag == "Unary") => { return cgRuntimeUnary(st, expr, env); }
+    if (tag == "Binary") => { return cgRuntimeBinary(st, expr, env); }
+    if (tag == "Conditional") => { return cgCompileRuntimeConditional(st, expr, env); }
+    if (tag == "Call") => { return cgRuntimeCall(st, expr, env); }
+    return [[], cgFail(st, "cannot compile expression")];
+)
+
+func cgRuntimeUnary(st, expr, env) => (
+    let r = cgRuntimeExpr(st, at(expr, 2), env);
+    if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+    if (at(expr, 1) == "-") => {
+        return [append(at(r, 0), "    neg x0, x0"), at(r, 1)];
+    }
+    if (at(expr, 1) == "!") => {
+        let lines = concat(at(r, 0), ["    cmp x0, #0", "    cset w0, eq"]);
+        return [lines, at(r, 1)];
+    }
+    return [[], cgFail(st, "unsupported unary operator '" + at(expr, 1) + "'")];
+)
+
+func cgRuntimeNumericBinary(st, expr, env) => (
+    let lr = cgRuntimeExpr(st, at(expr, 1), env);
+    if (cgFailed(at(lr, 1))) => { return [[], at(lr, 1)]; }
+    let lines = at(lr, 0);
+    lines = append(lines, "    str x0, [sp, #-16]!");
+    let rr = cgRuntimeExpr(at(lr, 1), at(expr, 3), env);
+    if (cgFailed(at(rr, 1))) => { return [[], at(rr, 1)]; }
+    lines = concat(lines, at(rr, 0));
+    lines = append(lines, "    ldr x1, [sp], #16");
+    let op = at(expr, 2);
+    if (op == "+") => { return [append(lines, "    add x0, x1, x0"), at(rr, 1)]; }
+    if (op == "-") => { return [append(lines, "    sub x0, x1, x0"), at(rr, 1)]; }
+    if (op == "*") => { return [append(lines, "    mul x0, x1, x0"), at(rr, 1)]; }
+    if (op == "/") => { return [append(lines, "    sdiv x0, x1, x0"), at(rr, 1)]; }
+    if (op == "%") => {
+        return [concat(lines, ["    sdiv x2, x1, x0", "    msub x0, x2, x0, x1"]), at(rr, 1)];
+    }
+    if (op == "==") => { return [concat(lines, ["    cmp x1, x0", "    cset w0, eq"]), at(rr, 1)]; }
+    if (op == "!=") => { return [concat(lines, ["    cmp x1, x0", "    cset w0, ne"]), at(rr, 1)]; }
+    if (op == "<") => { return [concat(lines, ["    cmp x1, x0", "    cset w0, lt"]), at(rr, 1)]; }
+    if (op == "<=") => { return [concat(lines, ["    cmp x1, x0", "    cset w0, le"]), at(rr, 1)]; }
+    if (op == ">") => { return [concat(lines, ["    cmp x1, x0", "    cset w0, gt"]), at(rr, 1)]; }
+    if (op == ">=") => { return [concat(lines, ["    cmp x1, x0", "    cset w0, ge"]), at(rr, 1)]; }
+    if (op == "&&") => {
+        let falseLabel = "L_and_false_" + toString(cgLabel(at(rr, 1)));
+        let endLabel = "L_and_end_" + toString(cgLabel(at(rr, 1)));
+        let st1 = cgSetLabel(at(rr, 1), cgLabel(at(rr, 1)) + 1);
+        lines = concat(lines, ["    cmp x1, #0", "    b.eq " + falseLabel,
+            "    cmp x0, #0", "    cset w0, ne", "    b " + endLabel,
+            falseLabel + ":", "    mov x0, #0", endLabel + ":"]);
+        return [lines, st1];
+    }
+    if (op == "||") => {
+        let trueLabel = "L_or_true_" + toString(cgLabel(at(rr, 1)));
+        let endLabel = "L_or_end_" + toString(cgLabel(at(rr, 1)));
+        let st1 = cgSetLabel(at(rr, 1), cgLabel(at(rr, 1)) + 1);
+        lines = concat(lines, ["    cmp x1, #0", "    b.ne " + trueLabel,
+            "    cmp x0, #0", "    cset w0, ne", "    b " + endLabel,
+            trueLabel + ":", "    mov x0, #1", endLabel + ":"]);
+        return [lines, st1];
+    }
+    return [[], cgFail(st, "unsupported operator '" + op + "' in runtime expression")];
+)
+
+func cgRuntimeBinary(st, expr, env) => (
+    let op = at(expr, 2);
+    let lk = cgStaticKind(st, at(expr, 1), env, []);
+    let rk = cgStaticKind(st, at(expr, 3), env, []);
+    if (op == "+") => {
+        if (lk == "string" || rk == "string") => {
+            if (lk != "string" || rk != "string") => {
+                if (lk == "null" || rk == "null") => {
+                    return [[], cgFail(st, "cannot concatenate a string with null")];
+                }
+                return [[], cgFail(st, "cannot concatenate a string with a non-string")];
+            }
+            let ll = cgRuntimeExpr(st, at(expr, 1), env);
+            if (cgFailed(at(ll, 1))) => { return [[], at(ll, 1)]; }
+            let lines = at(ll, 0);
+            lines = append(lines, "    stp x0, x1, [sp, #-16]!");
+            let rl = cgRuntimeExpr(at(ll, 1), at(expr, 3), env);
+            if (cgFailed(at(rl, 1))) => { return [[], at(rl, 1)]; }
+            lines = concat(lines, at(rl, 0));
+            lines = concat(lines, ["    ldp x2, x3, [sp], #16", "    bl _serenity_concat"]);
+            return [lines, at(rl, 1)];
+        }
+        return cgRuntimeNumericBinary(st, expr, env);
+    }
+    if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") => {
+        if (lk == "string" || rk == "string") => {
+            if (lk == "string" && rk == "string") => {
+                let rl = cgRuntimeExpr(st, at(expr, 3), env);
+                if (cgFailed(at(rl, 1))) => { return [[], at(rl, 1)]; }
+                let lines = at(rl, 0);
+                lines = append(lines, "    stp x0, x1, [sp, #-16]!");
+                let ll = cgRuntimeExpr(at(rl, 1), at(expr, 1), env);
+                if (cgFailed(at(ll, 1))) => { return [[], at(ll, 1)]; }
+                lines = concat(lines, at(ll, 0));
+                lines = concat(lines, ["    ldp x2, x3, [sp], #16", "    bl _serenity_str_cmp"]);
+                if (op == "==") => {
+                    return [concat(lines, ["    cmp x0, #0", "    cset w0, eq"]), at(ll, 1)];
+                }
+                if (op == "!=") => {
+                    return [concat(lines, ["    cmp x0, #0", "    cset w0, ne"]), at(ll, 1)];
+                }
+                if (op == "<") => {
+                    return [concat(lines, ["    cmp x0, #0", "    cset w0, lt"]), at(ll, 1)];
+                }
+                if (op == "<=") => {
+                    return [concat(lines, ["    cmp x0, #0", "    cset w0, le"]), at(ll, 1)];
+                }
+                if (op == ">") => {
+                    return [concat(lines, ["    cmp x0, #0", "    cset w0, gt"]), at(ll, 1)];
+                }
+                return [concat(lines, ["    cmp x0, #0", "    cset w0, ge"]), at(ll, 1)];
+            }
+            if (op == "==") => { return [["    mov x0, #0"], st]; }
+            if (op == "!=") => { return [["    mov x0, #1"], st]; }
+            if (lk == "string") => {
+                return [[], cgFail(st, "cannot compare string with " + cgKindName(rk))];
+            }
+            return [[], cgFail(st, "cannot compare " + cgKindName(lk) + " with string")];
+        }
+        return cgRuntimeNumericBinary(st, expr, env);
+    }
+    return cgRuntimeNumericBinary(st, expr, env);
+)
+
+func cgCompileRuntimeWhile(st, statement) => (
+    let startLabel = "L_while_start_" + toString(cgLabel(st));
+    let endLabel = "L_while_end_" + toString(cgLabel(st));
+    let st1 = cgSetLabel(st, cgLabel(st) + 1);
+    let lines = [startLabel + ":"];
+    let rc = cgCompileRuntimeCondition(st1, at(statement, 1), []);
+    if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+    lines = concat(lines, at(rc, 0));
+    lines = concat(lines, ["    cmp x0, #0", "    b.eq " + endLabel]);
+    let rs = cgCompileRuntimeStatements(at(rc, 1), at(statement, 2));
+    if (cgFailed(at(rs, 1))) => { return [[], at(rs, 1)]; }
+    lines = concat(lines, at(rs, 0));
+    lines = concat(lines, ["    b " + startLabel, endLabel + ":"]);
+    return [lines, at(rs, 1)];
+)
+
+func cgCompileRuntimeIf(st, statement) => (
+    let falseLabel = "L_if_false_" + toString(cgLabel(st));
+    let endLabel = "L_if_end_" + toString(cgLabel(st));
+    let st1 = cgSetLabel(st, cgLabel(st) + 1);
+    let rc = cgCompileRuntimeCondition(st1, at(statement, 1), []);
+    if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+    let lines = at(rc, 0);
+    lines = concat(lines, ["    cmp x0, #0", "    b.eq " + falseLabel]);
+    let rt = cgCompileRuntimeStatements(at(rc, 1), at(statement, 2));
+    if (cgFailed(at(rt, 1))) => { return [[], at(rt, 1)]; }
+    lines = concat(lines, at(rt, 0));
+    lines = concat(lines, ["    b " + endLabel, falseLabel + ":"]);
+    let elseB = cgFlattenElse(at(statement, 3));
+    let stf = at(rt, 1);
+    if (elseB != null) => {
+        let re = cgCompileRuntimeStatements(stf, elseB);
+        if (cgFailed(at(re, 1))) => { return [[], at(re, 1)]; }
+        lines = concat(lines, at(re, 0));
+        stf = at(re, 1);
+    }
+    lines = append(lines, endLabel + ":");
+    return [lines, stf];
+)
+
+func cgCompileRuntimeFor(st, statement) => (
+    let lines = [];
+    let init = at(statement, 1);
+    let st1 = st;
+    if (at(init, 0) == "LetStmt") => {
+        let name = at(init, 1);
+        if (!cgMapHas(cgOff(st1), name)) => {
+            let kind = cgStaticKind(st1, at(init, 2), cgCurrentEnv(st1), []);
+            st1 = cgAddRuntimeVar(st1, name, kind);
+        }
+        let ri = cgRuntimeExpr(st1, at(init, 2), []);
+        if (cgFailed(at(ri, 1))) => { return [[], at(ri, 1)]; }
+        lines = concat(lines, at(ri, 0));
+        st1 = at(ri, 1);
+        lines = concat(lines, cgStoreVarLines(st1, name));
+    }
+    let startLabel = "L_for_start_" + toString(cgLabel(st1));
+    let endLabel = "L_for_end_" + toString(cgLabel(st1));
+    let st2 = cgSetLabel(st1, cgLabel(st1) + 1);
+    lines = append(lines, startLabel + ":");
+    let rc = cgCompileRuntimeCondition(st2, at(statement, 2), []);
+    if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+    lines = concat(lines, at(rc, 0));
+    lines = concat(lines, ["    cmp x0, #0", "    b.eq " + endLabel]);
+    let rs = cgCompileRuntimeStatements(at(rc, 1), at(statement, 4));
+    if (cgFailed(at(rs, 1))) => { return [[], at(rs, 1)]; }
+    lines = concat(lines, at(rs, 0));
+    let stf = at(rs, 1);
+    if (at(statement, 3) != null && at(at(statement, 3), 0) == "IncrementStmt") => {
+        let ri = cgCompileRuntimeIncrement(stf, at(statement, 3));
+        if (cgFailed(at(ri, 1))) => { return [[], at(ri, 1)]; }
+        lines = concat(lines, at(ri, 0));
+        stf = at(ri, 1);
+    }
+    lines = concat(lines, ["    b " + startLabel, endLabel + ":"]);
+    return [lines, stf];
+)
+
+func cgRuntimeCall(st, expr, env) => (
+    let callee = at(expr, 1);
+    let args = at(expr, 2);
+    if (callee == "print" || callee == "println") => {
+        return cgRuntimePrint(st, callee, args, env);
+    }
+    if (callee == "eval") => {
+        if (length(args) != 1) => {
+            return [[], cgFail(st, "eval expects one argument")];
+        }
+        return cgRuntimeExpr(st, at(args, 0), env);
+    }
+    if (callee == "exit") => {
+        if (length(args) == 0) => {
+            return [["    mov x0, #0", "    bl _exit"], st];
+        }
+        if (length(args) != 1) => {
+            return [[], cgFail(st, "exit expects 0 or 1 argument")];
+        }
+        let r = cgRuntimeExpr(st, at(args, 0), env);
+        if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+        return [append(at(r, 0), "    bl _exit"), at(r, 1)];
+    }
+    let fn = cgMapFind(cgFuncs(st), callee);
+    if (fn != null) => {
+        let params = at(fn, 2);
+        let n = length(params);
+        if (length(args) != n) => {
+            return [[], cgFail(st, callee + " expects " + toString(n)
+                + " arguments, got " + toString(length(args)))];
+        }
+        let kr = cgFunctionParamKinds(st, fn);
+        let kinds = at(kr, 0);
+        let st1 = at(kr, 1);
+        let total = 0;
+        let i = 0;
+        while (i < length(args)) => {
+            let argKind = cgStaticKind(st1, at(args, i), env, []);
+            if (argKind == "list") => {
+                return [[], cgFail(st1, "cannot pass a list to compiled function '" + callee + "'")];
+            }
+            if (at(kinds, i) == "string") => {
+                if (argKind != "string" && argKind != "unknown") => {
+                    return [[], cgFail(st1, "'" + callee + "' expects a string, got "
+                        + cgKindName(argKind))];
+                }
+            }
+            else => {
+                if (argKind == "string") => {
+                    return [[], cgFail(st1,
+                        "cannot pass a string to non-string parameter of '" + callee + "'")];
+                }
+            }
+            total = total + cgWidth(at(kinds, i));
+            i = i + 1;
+        }
+        if (total > 8) => {
+            return [[], cgFail(st1, "too many arguments (" + toString(length(args))
+                + "), maximum is 8")];
+        }
+        let lines = [];
+        i = length(args) - 1;
+        while (i >= 0) => {
+            let r = cgRuntimeExpr(st1, at(args, i), env);
+            if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+            lines = concat(lines, at(r, 0));
+            st1 = at(r, 1);
+            if (at(kinds, i) == "string") => {
+                lines = concat(lines, ["    str x1, [sp, #-16]!", "    str x0, [sp, #-16]!"]);
+            }
+            else => { lines = append(lines, "    str x0, [sp, #-16]!"); }
+            i = i - 1;
+        }
+        i = 0;
+        while (i < total) => {
+            lines = append(lines, "    ldr x" + toString(i) + ", [sp], #16");
+            i = i + 1;
+        }
+        lines = append(lines, "    bl _serenity_" + callee);
+        return [lines, st1];
+    }
+    if (cgIsBuiltin(callee)) => {
+        if (!cgContainsRuntimeValue(st, expr)) => {
+            let r = cgConstantValue(st, expr);
+            if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+            let value = at(r, 0);
+            if (cgIsBool(value)) => { return [[cgMovBool(value)], at(r, 1)]; }
+            if (cgIsStr(value) || cgIsNull(value) || cgIsList(value)) => {
+                return [[], cgFail(st, "call '" + callee + "' produces a non-numeric value")];
+            }
+            return [["    mov x0, #" + toString(value)], at(r, 1)];
+        }
+        return cgRuntimeStringBuiltin(st, callee, args, env);
+    }
+    return [[], cgFail(st, "undefined function '" + callee + "'")];
+)
+
+func cgRuntimeStringBuiltin(st, callee, args, env) => (
+    let arity = cgBuiltinArity(callee);
+    if (length(args) != arity) => {
+        return [[], cgFail(st, callee + " expects " + toString(arity)
+            + " argument(s), got " + toString(length(args)))];
+    }
+    if (callee != "length" && callee != "charAt" && callee != "substring"
+        && callee != "toUpper" && callee != "toLower" && callee != "trim") => {
+        return [[], cgFail(st, "builtin '" + callee + "' is not yet supported at runtime")];
+    }
+    if (cgStaticKind(st, at(args, 0), env, []) != "string") => {
+        return [[], cgFail(st, "builtin '" + callee + "' is not yet supported inside user-defined functions")];
+    }
+    if (callee == "length") => {
+        let r = cgRuntimeExpr(st, at(args, 0), env);
+        if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+        return [append(at(r, 0), "    mov x0, x1"), at(r, 1)];
+    }
+    if (callee == "charAt") => {
+        let r0 = cgRuntimeExpr(st, at(args, 0), env);
+        if (cgFailed(at(r0, 1))) => { return [[], at(r0, 1)]; }
+        let lines = at(r0, 0);
+        lines = append(lines, "    stp x0, x1, [sp, #-16]!");
+        let r1 = cgRuntimeExpr(at(r0, 1), at(args, 1), env);
+        if (cgFailed(at(r1, 1))) => { return [[], at(r1, 1)]; }
+        lines = concat(lines, at(r1, 0));
+        lines = append(lines, "    mov x2, x0");
+        lines = concat(lines, ["    ldp x0, x1, [sp], #16", "    bl _serenity_char_at"]);
+        return [lines, at(r1, 1)];
+    }
+    if (callee == "substring") => {
+        let r0 = cgRuntimeExpr(st, at(args, 0), env);
+        if (cgFailed(at(r0, 1))) => { return [[], at(r0, 1)]; }
+        let lines = at(r0, 0);
+        lines = append(lines, "    stp x0, x1, [sp, #-16]!");
+        let r1 = cgRuntimeExpr(at(r0, 1), at(args, 1), env);
+        if (cgFailed(at(r1, 1))) => { return [[], at(r1, 1)]; }
+        lines = concat(lines, at(r1, 0));
+        lines = append(lines, "    str x0, [sp, #-16]!");
+        let r2 = cgRuntimeExpr(at(r1, 1), at(args, 2), env);
+        if (cgFailed(at(r2, 1))) => { return [[], at(r2, 1)]; }
+        lines = concat(lines, at(r2, 0));
+        lines = append(lines, "    mov x3, x0");
+        lines = concat(lines, ["    ldr x2, [sp], #16", "    ldp x0, x1, [sp], #16",
+            "    bl _serenity_substring"]);
+        return [lines, at(r2, 1)];
+    }
+    let r = cgRuntimeExpr(st, at(args, 0), env);
+    if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+    return [append(at(r, 0), "    bl " + cgSpHelper(callee)), at(r, 1)];
+)
+
+func cgRuntimePrint(st, callee, args, env) => (
+    if (length(args) != 1) => {
+        return [[], cgFail(st, callee + " expects one argument")];
+    }
+    let argument = at(args, 0);
+    let kind = cgStaticKind(st, argument, env, []);
+    let r = cgRuntimeExpr(st, argument, env);
+    if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+    let lines = at(r, 0);
+    if (kind == "string") => {
+        lines = concat(lines, ["    mov x2, x1", "    mov x1, x0", "    mov x0, #1", "    bl _write"]);
+    }
+    else => {
+        if (kind == "bool") => { lines = append(lines, "    bl _serenity_print_bool"); }
+        else => { lines = append(lines, "    bl _serenity_print_int"); }
+    }
+    if (callee == "println") => {
+        let w = cgWriteLines(at(r, 1), "\n");
+        if (cgFailed(at(w, 1))) => { return [[], at(w, 1)]; }
+        lines = concat(lines, at(w, 0));
+        return [lines, at(w, 1)];
+    }
+    return [lines, at(r, 1)];
+)
+
+// --- Constant-value expression compilation --------------------------------
+
+func cgStringValue(st, expr) => (
+    let tag = at(expr, 0);
+    if (tag == "StringLiteral") => { return at(expr, 1); }
+    if (tag == "Identifier") => {
+        let name = at(expr, 1);
+        if (!cgMapHas(cgVars(st), name)) => {
+            return null;
+        }
+        return cgStringValue(st, cgMapFind(cgVars(st), name));
+    }
+    return null;
+)
+
+func cgIsStringExpr(st, expr) => (
+    let tag = at(expr, 0);
+    if (tag == "StringLiteral") => { return true; }
+    if (tag == "Identifier") => {
+        return cgMapHas(cgVars(st), at(expr, 1))
+            && cgIsStringExpr(st, cgMapFind(cgVars(st), at(expr, 1)));
+    }
+    if (tag == "Binary") => {
+        return at(expr, 2) == "+"
+            && (cgIsStringExpr(st, at(expr, 1)) || cgIsStringExpr(st, at(expr, 3)));
+    }
+    if (tag == "Call") => { return cgIsStringProducing(at(expr, 1)); }
+    if (tag == "Conditional") => {
+        return cgIsStringExpr(st, at(expr, 2)) || cgIsStringExpr(st, at(expr, 3));
+    }
+    return false;
+)
+
+func cgIsComputedString(st, expr) => (
+    let tag = at(expr, 0);
+    if (tag == "StringLiteral") => { return false; }
+    if (tag == "Identifier") => {
+        return cgMapHas(cgVars(st), at(expr, 1))
+            && cgIsComputedString(st, cgMapFind(cgVars(st), at(expr, 1)));
+    }
+    if (tag == "Binary") => {
+        return at(expr, 2) == "+"
+            && (cgIsStringExpr(st, at(expr, 1)) || cgIsStringExpr(st, at(expr, 3)));
+    }
+    if (tag == "Call") => { return cgIsStringProducing(at(expr, 1)); }
+    if (tag == "Conditional") => {
+        return cgIsComputedString(st, at(expr, 2)) || cgIsComputedString(st, at(expr, 3));
+    }
+    return false;
+)
+
+func cgIsRuntimeComparison(st, expr) => (
+    let tag = at(expr, 0);
+    if (tag == "Binary") => {
+        let op = at(expr, 2);
+        if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") => {
+            return cgIsComputedString(st, at(expr, 1)) || cgIsComputedString(st, at(expr, 3));
+        }
+    }
+    return false;
+)
+
+func cgRuntimeComparison(st, expr) => (
+    let l = cgStringExpression(st, at(expr, 1));
+    if (cgFailed(at(l, 1))) => { return [[], at(l, 1)]; }
+    let lines = at(l, 0);
+    lines = append(lines, "    stp x0, x1, [sp, #-16]!");
+    let r = cgStringExpression(at(l, 1), at(expr, 3));
+    if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+    lines = concat(lines, at(r, 0));
+    lines = concat(lines, ["    ldp x2, x3, [sp], #16", "    bl _serenity_str_cmp"]);
+    let op = at(expr, 2);
+    if (op == "==") => { return [concat(lines, ["    cmp x0, #0", "    cset w0, eq"]), at(r, 1)]; }
+    if (op == "!=") => { return [concat(lines, ["    cmp x0, #0", "    cset w0, ne"]), at(r, 1)]; }
+    if (op == "<") => { return [concat(lines, ["    cmp x0, #0", "    cset w0, lt"]), at(r, 1)]; }
+    if (op == "<=") => { return [concat(lines, ["    cmp x0, #0", "    cset w0, le"]), at(r, 1)]; }
+    if (op == ">") => { return [concat(lines, ["    cmp x0, #0", "    cset w0, gt"]), at(r, 1)]; }
+    return [concat(lines, ["    cmp x0, #0", "    cset w0, ge"]), at(r, 1)];
+)
+
+func cgStringExpression(st, expr) => (
+    if (cgFailed(st)) => { return [[], st]; }
+    let tag = at(expr, 0);
+    if (tag == "StringLiteral") => {
+        let ns = cgNewString(st, at(expr, 1));
+        return [["    adrp x0, " + at(ns, 0) + "@PAGE",
+                 "    add x0, x0, " + at(ns, 0) + "@PAGEOFF",
+                 "    mov x1, #" + toString(at(ns, 1))], at(ns, 2)];
+    }
+    if (tag == "Identifier") => {
+        let name = at(expr, 1);
+        if (!cgMapHas(cgVars(st), name)) => {
+            return [[], cgFail(st, "undefined variable '" + name + "'")];
+        }
+        return cgStringExpression(st, cgMapFind(cgVars(st), name));
+    }
+    if (tag == "Conditional") => {
+        let c = cgConstantValue(st, at(expr, 1));
+        if (cgFailed(at(c, 1))) => { return [[], at(c, 1)]; }
+        if (cgTruthy(at(c, 0))) => { return cgStringExpression(at(c, 1), at(expr, 2)); }
+        return cgStringExpression(at(c, 1), at(expr, 3));
+    }
+    if (tag == "Binary" && at(expr, 2) == "+") => {
+        let chk = cgConstantValue(st, expr);
+        if (cgFailed(at(chk, 1))) => { return [[], at(chk, 1)]; }
+        let l = cgStringExpression(at(chk, 1), at(expr, 1));
+        if (cgFailed(at(l, 1))) => { return [[], at(l, 1)]; }
+        let lines = at(l, 0);
+        lines = append(lines, "    stp x0, x1, [sp, #-16]!");
+        let r = cgStringExpression(at(l, 1), at(expr, 3));
+        if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+        lines = concat(lines, at(r, 0));
+        lines = concat(lines, ["    ldp x2, x3, [sp], #16", "    bl _serenity_concat"]);
+        return [lines, at(r, 1)];
+    }
+    if (tag == "Call" && cgIsStringProducing(at(expr, 1))) => {
+        let callee = at(expr, 1);
+        let args = at(expr, 2);
+        let arity = cgSpArity(callee);
+        if (length(args) != arity) => {
+            return [[], cgFail(st, callee + " expects " + toString(arity)
+                + " argument(s), got " + toString(length(args)))];
+        }
+        let rv = cgConstantValue(st, expr);
+        if (cgFailed(at(rv, 1))) => { return [[], at(rv, 1)]; }
+        let value = at(rv, 0);
+        if (cgIsStr(value)) => {
+            let ns = cgNewString(at(rv, 1), value);
+            return [["    adrp x0, " + at(ns, 0) + "@PAGE",
+                     "    add x0, x0, " + at(ns, 0) + "@PAGEOFF",
+                     "    mov x1, #" + toString(at(ns, 1))], at(ns, 2)];
+        }
+        let helper = cgSpHelper(callee);
+        let sa = cgStringExpression(at(rv, 1), at(args, 0));
+        if (cgFailed(at(sa, 1))) => { return [[], at(sa, 1)]; }
+        let lines = at(sa, 0);
+        if (callee == "charAt") => {
+            let ci = cgConstantValue(at(sa, 1), at(args, 1));
+            if (cgFailed(at(ci, 1))) => { return [[], at(ci, 1)]; }
+            lines = append(lines, "    mov x2, #" + toString(at(ci, 0)));
+            lines = append(lines, "    bl " + helper);
+            return [lines, at(ci, 1)];
+        }
+        if (callee == "substring") => {
+            let c1 = cgConstantValue(at(sa, 1), at(args, 1));
+            if (cgFailed(at(c1, 1))) => { return [[], at(c1, 1)]; }
+            let c2 = cgConstantValue(at(c1, 1), at(args, 2));
+            if (cgFailed(at(c2, 1))) => { return [[], at(c2, 1)]; }
+            lines = append(lines, "    mov x2, #" + toString(at(c1, 0)));
+            lines = append(lines, "    mov x3, #" + toString(at(c2, 0)));
+            lines = append(lines, "    bl " + helper);
+            return [lines, at(c2, 1)];
+        }
+        lines = append(lines, "    bl " + helper);
+        return [lines, at(sa, 1)];
+    }
+    let v = cgConstantValue(st, expr);
+    if (cgFailed(at(v, 1))) => { return [[], at(v, 1)]; }
+    if (!cgIsStr(at(v, 0))) => {
+        return [[], cgFail(st, "expression does not produce a string")];
+    }
+    let ns = cgNewString(at(v, 1), at(v, 0));
+    return [["    adrp x0, " + at(ns, 0) + "@PAGE",
+             "    add x0, x0, " + at(ns, 0) + "@PAGEOFF",
+             "    mov x1, #" + toString(at(ns, 1))], at(ns, 2)];
+)
+
+func cgWriteLines(st, value) => (
+    let ns = cgNewString(st, value);
+    return [["    adrp x1, " + at(ns, 0) + "@PAGE",
+             "    add x1, x1, " + at(ns, 0) + "@PAGEOFF",
+             "    mov x0, #1",
+             "    mov x2, #" + toString(at(ns, 1)),
+             "    bl _write"], at(ns, 2)];
+)
+
+func cgPrintStatement(st, expr) => (
+    if (cgFailed(st)) => { return [[], st]; }
+    let callee = at(expr, 1);
+    let args = at(expr, 2);
+    if (length(args) != 1) => {
+        return [[], cgFail(st, callee + " expects one argument")];
+    }
+    let argument = at(args, 0);
+    let suffix = "";
+    if (callee == "println") => { suffix = "\n"; }
+    if (cgContainsRuntimeValue(st, argument)) => {
+        return cgRuntimePrint(st, callee, args, []);
+    }
+    let cv = cgConstantValue(st, argument);
+    if (cgFailed(at(cv, 1))) => { return [[], at(cv, 1)]; }
+    let constant = at(cv, 0);
+    if (cgIsStr(constant)) => {
+        if (cgStringValue(st, argument) != null) => {
+            return cgWriteLines(at(cv, 1), constant + suffix);
+        }
+        let se = cgStringExpression(at(cv, 1), argument);
+        if (cgFailed(at(se, 1))) => { return [[], at(se, 1)]; }
+        let lines = at(se, 0);
+        lines = concat(lines, ["    mov x2, x1", "    mov x1, x0",
+            "    mov x0, #1", "    bl _write"]);
+        if (suffix != "") => {
+            let w = cgWriteLines(at(se, 1), suffix);
+            if (cgFailed(at(w, 1))) => { return [[], at(w, 1)]; }
+            lines = concat(lines, at(w, 0));
+            return [lines, at(w, 1)];
+        }
+        return [lines, at(se, 1)];
+    }
+    if (cgIsList(constant)) => {
+        return cgWriteLines(at(cv, 1), toString(constant) + suffix);
+    }
+    if (cgIsBool(constant) || cgIsNull(constant)) => {
+        if (cgIsRuntimeComparison(st, argument)) => {
+            let rc = cgRuntimeComparison(at(cv, 1), argument);
+            if (cgFailed(at(rc, 1))) => { return [[], at(rc, 1)]; }
+            let lines = at(rc, 0);
+            lines = append(lines, "    bl _serenity_print_bool");
+            if (suffix != "") => {
+                let w = cgWriteLines(at(rc, 1), suffix);
+                if (cgFailed(at(w, 1))) => { return [[], at(w, 1)]; }
+                lines = concat(lines, at(w, 0));
+                return [lines, at(w, 1)];
+            }
+            return [lines, at(rc, 1)];
+        }
+        let text = "false";
+        if (constant == true) => { text = "true"; }
+        if (constant == null) => { text = "null"; }
+        return cgWriteLines(at(cv, 1), text + suffix);
+    }
+    let e = cgExpression(at(cv, 1), argument);
+    if (cgFailed(at(e, 1))) => { return [[], at(e, 1)]; }
+    let lines = at(e, 0);
+    lines = append(lines, "    bl _serenity_print_int");
+    if (suffix != "") => {
+        let w = cgWriteLines(at(e, 1), suffix);
+        if (cgFailed(at(w, 1))) => { return [[], at(w, 1)]; }
+        lines = concat(lines, at(w, 0));
+        return [lines, at(w, 1)];
+    }
+    return [lines, at(e, 1)];
+)
+
+func cgStatement(st, expr) => (
+    if (cgFailed(st)) => { return [[], st]; }
+    let tag = at(expr, 0);
+    if (tag == "Call") => {
+        let callee = at(expr, 1);
+        if (callee == "print" || callee == "println") => {
+            return cgPrintStatement(st, expr);
+        }
+        if (callee == "exit") => {
+            let args = at(expr, 2);
+            if (length(args) == 0) => {
+                return [["    mov x0, #0", "    bl _exit"], st];
+            }
+            if (length(args) != 1) => {
+                return [[], cgFail(st, "exit expects 0 or 1 argument")];
+            }
+            let r = cgExpression(st, at(args, 0));
+            if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+            return [append(at(r, 0), "    bl _exit"), at(r, 1)];
+        }
+    }
+    if (cgIsStringExpr(st, expr)) => { return cgStringExpression(st, expr); }
+    return cgExpression(st, expr);
+)
+
+func cgExpression(st, expr) => (
+    if (cgFailed(st)) => { return [[], st]; }
+    let tag = at(expr, 0);
+    if (cgContainsRuntimeValue(st, expr)) => {
+        return cgRuntimeExpr(st, expr, []);
+    }
+    if (tag == "IntLiteral") => { return [["    mov x0, #" + toString(at(expr, 1))], st]; }
+    if (tag == "BoolLiteral") => { return [[cgMovBool(at(expr, 1))], st]; }
+    if (tag == "NullLiteral") => {
+        return [[], cgFail(st, "null cannot be used in a numeric expression")];
+    }
+    if (tag == "Identifier") => {
+        let name = at(expr, 1);
+        if (cgMapHas(cgOff(st), name)) => {
+            return [["    ldr x0, [x29, #"
+                + toString(cgMapFind(cgOff(st), name)) + "]"], st];
+        }
+        if (!cgMapHas(cgVars(st), name)) => {
+            return [[], cgFail(st, "undefined variable '" + name + "'")];
+        }
+        let value = cgMapFind(cgVars(st), name);
+        if (cgStringValue(st, value) != null) => {
+            return [[], cgFail(st, "string variable '" + name
+                + "' cannot be used in a numeric expression")];
+        }
+        return cgExpression(st, value);
+    }
+    if (tag == "Call") => {
+        let callee = at(expr, 1);
+        let r = cgConstantValue(st, expr);
+        if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+        let value = at(r, 0);
+        if (cgIsBool(value)) => { return [[cgMovBool(value)], at(r, 1)]; }
+        if (cgIsStr(value) || cgIsNull(value) || cgIsList(value)) => {
+            return [[], cgFail(st, "call '" + callee + "' produces a non-numeric value")];
+        }
+        return [["    mov x0, #" + toString(value)], at(r, 1)];
+    }
+    if (tag == "Unary") => {
+        if (at(expr, 1) == "-") => {
+            let r = cgExpression(st, at(expr, 2));
+            if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+            return [append(at(r, 0), "    neg x0, x0"), at(r, 1)];
+        }
+        let r = cgConstantValue(st, expr);
+        if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+        return [[cgMovTruthy(at(r, 0))], at(r, 1)];
+    }
+    if (tag == "Conditional") => {
+        let r = cgConstantValue(st, expr);
+        if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+        let value = at(r, 0);
+        if (cgIsBool(value)) => { return [[cgMovBool(value)], at(r, 1)]; }
+        if (cgIsNull(value) || cgIsStr(value)) => {
+            return [[], cgFail(st,
+                "non-numeric conditional cannot be used in a numeric expression")];
+        }
+        return [["    mov x0, #" + toString(value)], at(r, 1)];
+    }
+    if (tag == "Binary") => {
+        let op = at(expr, 2);
+        if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">"
+            || op == ">=" || op == "&&" || op == "||" || op == "^") => {
+            let r = cgConstantValue(st, expr);
+            if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+            let value = at(r, 0);
+            if (cgIsBool(value)) => { return [[cgMovBool(value)], at(r, 1)]; }
+            return [["    mov x0, #" + toString(value)], at(r, 1)];
+        }
+        let l = cgExpression(st, at(expr, 1));
+        if (cgFailed(at(l, 1))) => { return [[], at(l, 1)]; }
+        let lines = at(l, 0);
+        lines = append(lines, "    str x0, [sp, #-16]!");
+        let r = cgExpression(at(l, 1), at(expr, 3));
+        if (cgFailed(at(r, 1))) => { return [[], at(r, 1)]; }
+        lines = concat(lines, at(r, 0));
+        lines = append(lines, "    ldr x1, [sp], #16");
+        if (op == "+") => { return [append(lines, "    add x0, x1, x0"), at(r, 1)]; }
+        if (op == "-") => { return [append(lines, "    sub x0, x1, x0"), at(r, 1)]; }
+        if (op == "*") => { return [append(lines, "    mul x0, x1, x0"), at(r, 1)]; }
+        if (op == "/") => { return [append(lines, "    sdiv x0, x1, x0"), at(r, 1)]; }
+        if (op == "%") => {
+            return [concat(lines, ["    sdiv x2, x1, x0", "    msub x0, x2, x0, x1"]), at(r, 1)];
+        }
+        return [[], cgFail(st, "unsupported operator '" + op + "'")];
+    }
+    return [[], cgFail(st,
+        "compiled programs currently support integer eval expressions and string output")];
+)
+func cgPrintIntLines() => (
+    return ["_serenity_print_int:",
+        "    stp x29, x30, [sp, #-48]!",
+        "    mov x29, sp",
+        "    mov x9, x0",
+        "    add x1, sp, #47",
+        "    mov x10, #10",
+        "    mov w13, #0",
+        "    cmp x9, #0",
+        "    b.ge L_int_nonnegative",
+        "    neg x9, x9",
+        "    mov w13, #1",
+        "L_int_nonnegative:",
+        "    cmp x9, #0",
+        "    b.ne L_int_loop",
+        "    mov w11, #48",
+        "    strb w11, [x1, #-1]!",
+        "    b L_int_write",
+        "L_int_loop:",
+        "    udiv x11, x9, x10",
+        "    msub x12, x11, x10, x9",
+        "    add x12, x12, #48",
+        "    strb w12, [x1, #-1]!",
+        "    mov x9, x11",
+        "    cbnz x9, L_int_loop",
+        "    cbz w13, L_int_write",
+        "    mov w11, #45",
+        "    strb w11, [x1, #-1]!",
+        "L_int_write:",
+        "    add x2, sp, #47",
+        "    sub x2, x2, x1",
+        "    mov x0, #1",
+        "    bl _write",
+        "    ldp x29, x30, [sp], #48",
+        "    ret"];
+)
+
+func cgPrintBoolLines(falseLabel, falseSize, trueLabel, trueSize) => (
+    return ["_serenity_print_bool:",
+        "    stp x29, x30, [sp, #-16]!",
+        "    mov x29, sp",
+        "    cbnz x0, L_bool_true",
+        "    adrp x1, " + falseLabel + "@PAGE",
+        "    add x1, x1, " + falseLabel + "@PAGEOFF",
+        "    mov x2, #" + toString(falseSize) + "",
+        "    b L_bool_write",
+        "L_bool_true:",
+        "    adrp x1, " + trueLabel + "@PAGE",
+        "    add x1, x1, " + trueLabel + "@PAGEOFF",
+        "    mov x2, #" + toString(trueSize) + "",
+        "L_bool_write:",
+        "    mov x0, #1",
+        "    bl _write",
+        "    ldp x29, x30, [sp], #16",
+        "    ret"];
+)
+
+func cgStrCmpLines() => (
+    return ["_serenity_str_cmp:",
+        "    mov x4, x0",
+        "    mov x5, x1",
+        "    mov x6, x2",
+        "    mov x7, x3",
+        "    mov x0, #0",
+        "    mov x8, #0",
+        "L_str_cmp_loop:",
+        "    cmp x8, x5",
+        "    b.ge L_str_cmp_after_right",
+        "    cmp x8, x7",
+        "    b.ge L_str_cmp_after_left",
+        "    ldrb w9, [x6, x8]",
+        "    ldrb w10, [x4, x8]",
+        "    cmp x9, x10",
+        "    b.lt L_str_cmp_less",
+        "    b.gt L_str_cmp_greater",
+        "    add x8, x8, #1",
+        "    b L_str_cmp_loop",
+        "L_str_cmp_after_right:",
+        "    cmp x8, x7",
+        "    b.lt L_str_cmp_greater",
+        "    ret",
+        "L_str_cmp_after_left:",
+        "    mov x0, #-1",
+        "    ret",
+        "L_str_cmp_less:",
+        "    mov x0, #-1",
+        "    ret",
+        "L_str_cmp_greater:",
+        "    mov x0, #1",
+        "    ret"];
+)
+
+func cgConcatLines() => (
+    return ["_serenity_concat:",
+        "    stp x29, x30, [sp, #-16]!",
+        "    mov x29, sp",
+        "    stp x0, x1, [sp, #-16]!",
+        "    stp x2, x3, [sp, #-16]!",
+        "    add x0, x1, x3",
+        "    bl _malloc",
+        "    mov x9, x0",
+        "    ldp x2, x3, [sp], #16",
+        "    ldp x10, x11, [sp], #16",
+        "    mov x12, x9",
+        "    mov x13, #0",
+        "L_concat_copy_left:",
+        "    cmp x13, x3",
+        "    b.ge L_concat_copy_right",
+        "    ldrb w14, [x2, x13]",
+        "    strb w14, [x12, x13]",
+        "    add x13, x13, #1",
+        "    b L_concat_copy_left",
+        "L_concat_copy_right:",
+        "    mov x13, #0",
+        "    add x12, x9, x3",
+        "L_concat_copy_right_loop:",
+        "    cmp x13, x11",
+        "    b.ge L_concat_done",
+        "    ldrb w14, [x10, x13]",
+        "    strb w14, [x12, x13]",
+        "    add x13, x13, #1",
+        "    b L_concat_copy_right_loop",
+        "L_concat_done:",
+        "    mov x0, x9",
+        "    add x1, x3, x11",
+        "    ldp x29, x30, [sp], #16",
+        "    ret"];
+)
+
+func cgSubstringLines() => (
+    return ["_serenity_substring:",
+        "    stp x29, x30, [sp, #-16]!",
+        "    mov x29, sp",
+        "    stp x0, x1, [sp, #-16]!",
+        "    stp x2, x3, [sp, #-16]!",
+        "    sub x0, x3, x2",
+        "    bl _malloc",
+        "    mov x7, x0",
+        "    ldp x2, x3, [sp], #16",
+        "    ldp x0, x1, [sp], #16",
+        "    sub x8, x3, x2",
+        "    mov x10, #0",
+        "    add x11, x0, x2",
+        "L_substring_loop:",
+        "    cmp x10, x8",
+        "    b.ge L_substring_done",
+        "    ldrb w12, [x11, x10]",
+        "    strb w12, [x7, x10]",
+        "    add x10, x10, #1",
+        "    b L_substring_loop",
+        "L_substring_done:",
+        "    mov x0, x7",
+        "    mov x1, x8",
+        "    ldp x29, x30, [sp], #16",
+        "    ret"];
+)
+
+func cgCharAtLines() => (
+    return ["_serenity_char_at:",
+        "    stp x29, x30, [sp, #-16]!",
+        "    mov x29, sp",
+        "    stp x0, x1, [sp, #-16]!",
+        "    stp x2, xzr, [sp, #-16]!",
+        "    mov x0, #1",
+        "    bl _malloc",
+        "    mov x5, x0",
+        "    ldp x2, xzr, [sp], #16",
+        "    ldp x0, x1, [sp], #16",
+        "    ldrb w6, [x0, x2]",
+        "    strb w6, [x5]",
+        "    mov x0, x5",
+        "    mov x1, #1",
+        "    ldp x29, x30, [sp], #16",
+        "    ret"];
+)
+
+func cgToUpperLines() => (
+    return ["_serenity_to_upper:",
+        "    stp x29, x30, [sp, #-16]!",
+        "    mov x29, sp",
+        "    stp x0, x1, [sp, #-16]!",
+        "    mov x0, x1",
+        "    bl _malloc",
+        "    mov x4, x0",
+        "    ldp x2, x3, [sp], #16",
+        "    mov x5, #0",
+        "L_to_upper_loop:",
+        "    cmp x5, x3",
+        "    b.ge L_to_upper_done",
+        "    ldrb w6, [x2, x5]",
+        "    cmp w6, #97",
+        "    b.lt L_to_upper_store",
+        "    cmp w6, #122",
+        "    b.gt L_to_upper_store",
+        "    sub w6, w6, #32",
+        "L_to_upper_store:",
+        "    strb w6, [x4, x5]",
+        "    add x5, x5, #1",
+        "    b L_to_upper_loop",
+        "L_to_upper_done:",
+        "    mov x0, x4",
+        "    mov x1, x3",
+        "    ldp x29, x30, [sp], #16",
+        "    ret"];
+)
+
+func cgToLowerLines() => (
+    return ["_serenity_to_lower:",
+        "    stp x29, x30, [sp, #-16]!",
+        "    mov x29, sp",
+        "    stp x0, x1, [sp, #-16]!",
+        "    mov x0, x1",
+        "    bl _malloc",
+        "    mov x4, x0",
+        "    ldp x2, x3, [sp], #16",
+        "    mov x5, #0",
+        "L_to_lower_loop:",
+        "    cmp x5, x3",
+        "    b.ge L_to_lower_done",
+        "    ldrb w6, [x2, x5]",
+        "    cmp w6, #65",
+        "    b.lt L_to_lower_store",
+        "    cmp w6, #90",
+        "    b.gt L_to_lower_store",
+        "    add w6, w6, #32",
+        "L_to_lower_store:",
+        "    strb w6, [x4, x5]",
+        "    add x5, x5, #1",
+        "    b L_to_lower_loop",
+        "L_to_lower_done:",
+        "    mov x0, x4",
+        "    mov x1, x3",
+        "    ldp x29, x30, [sp], #16",
+        "    ret"];
+)
+
+func cgTrimLines() => (
+    return ["_serenity_trim:",
+        "    stp x29, x30, [sp, #-16]!",
+        "    mov x29, sp",
+        "    stp x0, x1, [sp, #-16]!",
+        "    mov x2, x0",
+        "    mov x3, x1",
+        "    mov x4, #0",
+        "L_trim_skip_start:",
+        "    cmp x4, x3",
+        "    b.ge L_trim_compute",
+        "    ldrb w5, [x2, x4]",
+        "    cmp w5, #32",
+        "    b.eq L_trim_next_start",
+        "    cmp w5, #9",
+        "    b.eq L_trim_next_start",
+        "    cmp w5, #10",
+        "    b.eq L_trim_next_start",
+        "    cmp w5, #13",
+        "    b.eq L_trim_next_start",
+        "    b L_trim_compute",
+        "L_trim_next_start:",
+        "    add x4, x4, #1",
+        "    b L_trim_skip_start",
+        "L_trim_compute:",
+        "    mov x6, x3",
+        "L_trim_skip_end:",
+        "    cmp x6, x4",
+        "    b.le L_trim_copy",
+        "    add x7, x6, #-1",
+        "    ldrb w5, [x2, x7]",
+        "    cmp w5, #32",
+        "    b.eq L_trim_next_end",
+        "    cmp w5, #9",
+        "    b.eq L_trim_next_end",
+        "    cmp w5, #10",
+        "    b.eq L_trim_next_end",
+        "    cmp w5, #13",
+        "    b.eq L_trim_next_end",
+        "    b L_trim_copy",
+        "L_trim_next_end:",
+        "    sub x6, x6, #1",
+        "    b L_trim_skip_end",
+        "L_trim_copy:",
+        "    sub x8, x6, x4",
+        "    stp x8, x4, [sp, #-16]!",
+        "    mov x0, x8",
+        "    bl _malloc",
+        "    mov x9, x0",
+        "    ldp x8, x4, [sp], #16",
+        "    ldp x2, x3, [sp], #16",
+        "    mov x10, #0",
+        "    add x11, x2, x4",
+        "L_trim_copy_loop:",
+        "    cmp x10, x8",
+        "    b.ge L_trim_done",
+        "    ldrb w5, [x11, x10]",
+        "    strb w5, [x9, x10]",
+        "    add x10, x10, #1",
+        "    b L_trim_copy_loop",
+        "L_trim_done:",
+        "    mov x0, x9",
+        "    mov x1, x8",
+        "    ldp x29, x30, [sp], #16",
+        "    ret"];
+)
+
+func cgFunctionsMap(functions) => (
+    let out = [];
+    let i = 0;
+    while (i < length(functions)) => {
+        out = cgMapSet(out, at(at(functions, i), 1), at(functions, i));
+        i = i + 1;
+    }
+    return out;
+)
+
+func cgJoin(text, value) => (
+    if (length(text) == 0) => { return value; }
+    return text + "\n" + value;
+)
+
+func cgGenerate(program) => (
+    let functions = at(program, 1);
+    let mains = [];
+    let i = 0;
+    while (i < length(functions)) => {
+        if (at(at(functions, i), 1) == "main") => { mains = append(mains, at(functions, i)); }
+        i = i + 1;
+    }
+    let funcsMap = cgFunctionsMap(functions);
+    if (length(mains) != 1) => {
+        cgFail([[], 0, [], [], [], 0, null, [], [], false, funcsMap],
+            "program must declare exactly one 'main' function");
+        return "";
+    }
+    let main = at(mains, 0);
+    if (length(at(main, 2)) != 0) => {
+        cgFail([[], 0, [], [], [], 0, null, [], [], false, funcsMap],
+            "'main' cannot take parameters");
+        return "";
+    }
+    let st0 = [[], 0, [], [], [], 0, null, [], [], false, funcsMap];
+    let mainReturnLabel = "L_main_return_" + toString(0);
+    let st1 = cgSetRetlbl(cgSetLabel(st0, 1), mainReturnLabel);
+    let rbody = cgCompileStatements(st1, at(main, 3), false);
+    if (cgFailed(at(rbody, 1))) => { return ""; }
+    let st2 = cgSetRetlbl(at(rbody, 1), null);
+    let mainFrame = cgAlign16(16 + 8 * cgCountRuntimeLets(st2, at(main, 3)));
+    let userFunctionCode = [];
+    i = 0;
+    while (i < length(functions)) => {
+        if (at(at(functions, i), 1) != "main") => {
+            let rf = cgCompileUserFunction(st2, at(functions, i));
+            if (cgFailed(at(rf, 1))) => { return ""; }
+            userFunctionCode = concat(userFunctionCode, at(rf, 0));
+            userFunctionCode = append(userFunctionCode, "");
+            st2 = at(rf, 1);
+        }
+        i = i + 1;
+    }
+    let bf = cgNewString(st2, "false");
+    let bt = cgNewString(at(bf, 2), "true");
+    let strings = cgStrings(at(bt, 2));
+    let data = [".section __DATA,__data"];
+    i = 0;
+    while (i < length(strings)) => {
+        data = append(data, at(at(strings, i), 0) + ":");
+        data = append(data, "    .asciz " + cgQuote(at(at(strings, i), 1)));
+        i = i + 1;
+    }
+    let out = [".build_version macos, 11, 0 sdk_version 11, 0",
+        ".globl _main",
+        ".extern _write",
+        ".extern _malloc",
+        ".extern _exit",
+        ".section __TEXT,__text,regular,pure_instructions",
+        "_main:",
+        "    stp x29, x30, [sp, #-" + toString(mainFrame) + "]!",
+        "    mov x29, sp"];
+    out = concat(out, at(rbody, 0));
+    out = concat(out, [mainReturnLabel + ":", "    mov w0, #0",
+        "    ldp x29, x30, [sp], #" + toString(mainFrame), "    ret", ""]);
+    out = concat(out, userFunctionCode);
+    out = concat(out, cgPrintIntLines());
+    out = concat(out, cgPrintBoolLines(at(bf, 0), at(bf, 1), at(bt, 0), at(bt, 1)));
+    out = concat(out, [""]);
+    out = concat(out, cgStrCmpLines());
+    out = concat(out, [""]);
+    out = concat(out, cgConcatLines());
+    out = concat(out, [""]);
+    out = concat(out, cgSubstringLines());
+    out = concat(out, [""]);
+    out = concat(out, cgCharAtLines());
+    out = concat(out, [""]);
+    out = concat(out, cgToUpperLines());
+    out = concat(out, [""]);
+    out = concat(out, cgToLowerLines());
+    out = concat(out, [""]);
+    out = concat(out, cgTrimLines());
+    out = concat(out, ["", ""]);
+    out = concat(out, data);
+    out = append(out, "");
+    let text = "";
+    i = 0;
+    while (i < length(out)) => {
+        text = cgJoin(text, at(out, i));
+        i = i + 1;
+    }
+    return text;
+)
+
+func cgen(program) => (
+    return cgGenerate(program);
+)
