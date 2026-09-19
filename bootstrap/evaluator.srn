@@ -1,0 +1,748 @@
+// Serenity bootstrap: evaluator
+//
+// The third stage of bootstrapping the Serenity compiler in itself. This
+// module re-implements src/evaluator.py (together with the runtime semantics
+// of src/binary_ops.py, src/list_builtins.py and src/string_builtins.py) as
+// ordinary Serenity functions. It walks the nested-list tree produced by the
+// bootstrap parser (see parser.srn) and evaluates a program to a result.
+//
+// Contract:
+//   eInterpret(program) -> [result, state]
+//
+// where `program` is a Program node ("Program", [function, ...]) and `state`
+// carries the output the program produced plus how it finished:
+//
+//   state = [env, output, status, arg, functions]
+//     env       list of [name, value] bindings (immutable; names are unique)
+//     output    list of strings in the order the program printed them
+//     status    0 normal, 1 returned, 2 runtime error, 3 exited
+//     arg       the returned value (status 1), error message (status 2) or
+//               exit code (status 3)
+//     functions the program's function table, carried along so calls resolve
+//
+// Runtime values use exactly the host representation: integers and strings are
+// native values, booleans are true/false, null is null and lists are nested
+// values (Serenity's list literals evaluate to the host's immutable sequence,
+// the same representation the parser and scanner produce).
+//
+// Errors cannot raise in Serenity: where the host evaluator raises
+// RuntimeError the bootstrap evaluator sets status 2 and records the message,
+// and the driver prints "RUNTIME ERROR: <message>" once the output produced so
+// far has been flushed (matching the host, which prints before it raises).
+// `exit` is the one divergence: it cannot tear down the host, so it records
+// status 3 and the driver stops quietly instead.
+//
+// Serenity has no `isinstance`, so value kinds are recognised without it:
+// `toString(v) == v` is true for strings only, `v == null` is true for null
+// only, booleans are told from the integers 0/1 by also comparing toString,
+// and lists are the remaining kind whose canonical text starts with '['.
+// See eIsStr/eIsTrue/eIsFalse/eIsNull/eIsList/eIsInt.
+//
+// NOTE on naming: every helper is prefixed `e` (evaluate) so this module can
+// be inlined alongside scanner.srn and parser.srn without clashing with their
+// `scan`/`advance`/`parse`/`p*` names.
+
+func eInterpret(program) => (
+    let functions = at(program, 1);
+    let s = eState([], [], 0, null, functions);
+    let main = eFindFunc(functions, "main");
+    if (main == null) => {
+        return [null, eErr(s, "no 'main' function declared")];
+    }
+    return eUserCall("main", main, [], s);
+)
+
+// --- State and pair helpers -----------------------------------------------
+// A state is [env, output, status, arg, functions]. Most evaluation functions
+// return [value, state]; statement functions return [changed, value, state].
+
+func eState(env, output, status, arg, functions) => (
+    return [env, output, status, arg, functions];
+)
+func eEnv(s) => ( return at(s, 0); )
+func eOut(s) => ( return at(s, 1); )
+func eStatus(s) => ( return at(s, 2); )
+func eArg(s) => ( return at(s, 3); )
+func eFuncs(s) => ( return at(s, 4); )
+func eVal(pair) => ( return at(pair, 0); )
+func eSt(pair) => ( return at(pair, 1); )
+func eNorm(s) => ( return eState(eEnv(s), eOut(s), 0, null, eFuncs(s)); )
+func eRet(s, value) => ( return eState(eEnv(s), eOut(s), 1, value, eFuncs(s)); )
+func eErr(s, message) => ( return eState(eEnv(s), eOut(s), 2, message, eFuncs(s)); )
+
+// --- Value kinds ----------------------------------------------------------
+
+func eIsStr(v) => (
+    return toString(v) == v && !(v == true) && !(v == false);
+)
+func eIsTrue(v) => (
+    return v == true && toString(v) == "true";
+)
+func eIsFalse(v) => (
+    return v == false && toString(v) == "false";
+)
+func eIsNull(v) => (
+    return v == null;
+)
+func eIsList(v) => (
+    if (eIsStr(v) || eIsTrue(v) || eIsFalse(v) || eIsNull(v)) => { return false; }
+    return substring(toString(v), 0, 1) == "[";
+)
+func eIsInt(v) => (
+    return !eIsStr(v) && !eIsTrue(v) && !eIsFalse(v) && !eIsNull(v) && !eIsList(v);
+)
+
+// Names used by src/list_builtins.py and src/binary_ops.py in error messages.
+func eKind(v) => (
+    if (eIsStr(v)) => { return "string"; }
+    if (eIsList(v)) => { return "list"; }
+    if (eIsNull(v)) => { return "null"; }
+    if (eIsTrue(v) || eIsFalse(v)) => { return "bool"; }
+    return "integer";
+)
+// Names used by src/string_builtins.py in error messages (it reports
+// Python's type(value).__name__).
+func ePyName(v) => (
+    if (eIsStr(v)) => { return "str"; }
+    if (eIsList(v)) => { return "tuple"; }
+    if (eIsNull(v)) => { return "NoneType"; }
+    if (eIsTrue(v) || eIsFalse(v)) => { return "bool"; }
+    return "int";
+)
+
+func eDisplay(v) => (
+    return toString(v);
+)
+func eTruthy(v) => (
+    return v != false && v != null && v != "" && v != 0 && v != [];
+)
+
+// --- Environment helpers --------------------------------------------------
+// An environment is an immutable list of [name, value] pairs. The language
+// forbids shadowing (a nested block that copies an environment cannot `let` a
+// name that is already visible), so every visible name occurs exactly once.
+
+func eHas(env, name) => (
+    let i = 0;
+    let found = false;
+    while (i < length(env)) => {
+        if (at(at(env, i), 0) == name) => { found = true; }
+        i = i + 1;
+    }
+    return found;
+)
+func eLookup(env, name) => (
+    let i = 0;
+    let value = null;
+    while (i < length(env)) => {
+        if (at(at(env, i), 0) == name) => { value = at(at(env, i), 1); }
+        i = i + 1;
+    }
+    return value;
+)
+func eSet(env, name, value) => (
+    let out = [];
+    let i = 0;
+    while (i < length(env)) => {
+        if (at(at(env, i), 0) == name) => {
+            out = append(out, [name, value]);
+        } else => {
+            out = append(out, at(env, i));
+        }
+        i = i + 1;
+    }
+    return out;
+)
+func eAdd(env, name, value) => (
+    return append(env, [name, value]);
+)
+func eBind(params, values) => (
+    let env = [];
+    let i = 0;
+    while (i < length(params)) => {
+        env = eAdd(env, at(params, i), at(values, i));
+        i = i + 1;
+    }
+    return env;
+)
+
+func eFindFunc(functions, name) => (
+    let i = 0;
+    let found = null;
+    while (i < length(functions)) => {
+        if (at(at(functions, i), 1) == name) => { found = at(functions, i); }
+        i = i + 1;
+    }
+    return found;
+)
+
+// --- Calls ----------------------------------------------------------------
+
+func eCall(name, args, s) => (
+    if (name == "print") => { return ePrintNative(name, args, s, false); }
+    if (name == "println") => { return ePrintNative(name, args, s, true); }
+    if (name == "eval") => { return eEvalNative(args, s); }
+    if (name == "exit") => { return eExitNative(args, s); }
+    let function = eFindFunc(eFuncs(s), name);
+    if (function != null) => { return eUserCall(name, function, args, s); }
+    if (contains(eNativeNames(), name)) => { return eNativeCall(name, args, s); }
+    return [null, eErr(s, "undefined function '" + name + "'")];
+)
+
+func eEvalArgs(argNodes, s) => (
+    let values = [];
+    let st = s;
+    let i = 0;
+    while (i < length(argNodes) && eStatus(st) == 0) => {
+        let v = eExpr(at(argNodes, i), st);
+        values = append(values, eVal(v));
+        st = eSt(v);
+        i = i + 1;
+    }
+    return [values, st];
+)
+
+func eUserCall(name, function, args, s) => (
+    let params = at(function, 2);
+    if (length(params) != length(args)) => {
+        return [null, eErr(s, name + " expects " + toString(length(params))
+            + " arguments, got " + toString(length(args)))];
+    }
+    let evaluated = eEvalArgs(args, s);
+    if (eStatus(eSt(evaluated)) != 0) => { return [null, eSt(evaluated)]; }
+    let bodyState = eState(eBind(params, eVal(evaluated)), eOut(eSt(evaluated)), 0,
+        null, eFuncs(s));
+    let body = eStatements(at(function, 3), bodyState);
+    let final = eSt(body);
+    // The callee ran in its own environment and cannot see or change the
+    // caller's bindings, so restore the caller's environment while keeping
+    // the output the callee produced.
+    let restored = eState(eEnv(s), eOut(final), eStatus(final), eArg(final), eFuncs(s));
+    if (eStatus(final) == 3) => { return [null, restored]; }
+    if (eStatus(final) == 2) => { return [null, restored]; }
+    if (eStatus(final) == 1) => { return [eArg(final), eNorm(restored)]; }
+    return [eVal(body), eNorm(restored)];
+)
+
+// --- print / println / eval / exit ----------------------------------------
+
+func ePrintNative(name, args, s, newline) => (
+    if (length(args) != 1) => {
+        return [null, eErr(s, name + " expects 1 argument(s), got " + toString(length(args)))];
+    }
+    let evaluated = eEvalArgs(args, s);
+    if (eStatus(eSt(evaluated)) != 0) => { return [null, eSt(evaluated)]; }
+    let text = eDisplay(at(eVal(evaluated), 0));
+    if (newline) => { text = text + "\n"; }
+    return [null, eState(eEnv(eSt(evaluated)), append(eOut(eSt(evaluated)), text), 0,
+        null, eFuncs(eSt(evaluated)))];
+)
+
+func eEvalNative(args, s) => (
+    if (length(args) != 1) => {
+        return [null, eErr(s, "eval expects 1 argument(s), got " + toString(length(args)))];
+    }
+    return eExpr(at(args, 0), s);
+)
+
+func eExitNative(args, s) => (
+    if (length(args) == 0) => {
+        return [null, eState(eEnv(s), eOut(s), 3, 0, eFuncs(s))];
+    }
+    if (length(args) != 1) => {
+        return [null, eErr(s, "exit expects 1 argument(s), got " + toString(length(args)))];
+    }
+    let evaluated = eEvalArgs(args, s);
+    if (eStatus(eSt(evaluated)) != 0) => { return [null, eSt(evaluated)]; }
+    return [null, eState(eEnv(eSt(evaluated)), eOut(eSt(evaluated)), 3,
+        at(eVal(evaluated), 0), eFuncs(eSt(evaluated)))];
+)
+
+// --- Native builtins ------------------------------------------------------
+
+func eNativeNames() => (
+    return ["charAt", "substring", "toUpper", "toLower", "trim", "toInt",
+        "length", "contains", "indexOf", "at", "append", "prepend", "head",
+        "tail", "reverse", "concat", "join", "toString"];
+)
+
+func eNativeArity(name) => (
+    if (name == "charAt") => { return 2; }
+    if (name == "substring") => { return 3; }
+    if (name == "toUpper") => { return 1; }
+    if (name == "toLower") => { return 1; }
+    if (name == "trim") => { return 1; }
+    if (name == "toInt") => { return 1; }
+    if (name == "length") => { return 1; }
+    if (name == "contains") => { return 2; }
+    if (name == "indexOf") => { return 2; }
+    if (name == "at") => { return 2; }
+    if (name == "append") => { return 2; }
+    if (name == "prepend") => { return 2; }
+    if (name == "head") => { return 1; }
+    if (name == "tail") => { return 1; }
+    if (name == "reverse") => { return 1; }
+    if (name == "concat") => { return 2; }
+    if (name == "join") => { return 2; }
+    if (name == "toString") => { return 1; }
+    return 0;
+)
+
+func eNativeCall(name, args, s) => (
+    let arity = eNativeArity(name);
+    if (length(args) != arity) => {
+        return [null, eErr(s, name + " expects " + toString(arity)
+            + " argument(s), got " + toString(length(args)))];
+    }
+    let evaluated = eEvalArgs(args, s);
+    if (eStatus(eSt(evaluated)) != 0) => { return [null, eSt(evaluated)]; }
+    return eApplyNative(name, eVal(evaluated), eSt(evaluated));
+)
+
+func eApplyNative(name, values, s) => (
+    if (name == "length") => { return eNatLength(at(values, 0), s); }
+    if (name == "contains") => { return eNatContains(at(values, 0), at(values, 1), s); }
+    if (name == "indexOf") => { return eNatIndexOf(at(values, 0), at(values, 1), s); }
+    if (name == "at") => { return eNatAt(at(values, 0), at(values, 1), s); }
+    if (name == "append") => { return eNatAppend(at(values, 0), at(values, 1), s); }
+    if (name == "prepend") => { return eNatPrepend(at(values, 0), at(values, 1), s); }
+    if (name == "head") => { return eNatHead(at(values, 0), s); }
+    if (name == "tail") => { return eNatTail(at(values, 0), s); }
+    if (name == "reverse") => { return eNatReverse(at(values, 0), s); }
+    if (name == "concat") => { return eNatConcat(at(values, 0), at(values, 1), s); }
+    if (name == "join") => { return eNatJoin(at(values, 0), at(values, 1), s); }
+    if (name == "toString") => { return [toString(at(values, 0)), s]; }
+    if (name == "charAt") => { return eNatCharAt(at(values, 0), at(values, 1), s); }
+    if (name == "substring") => { return eNatSubstring(at(values, 0), at(values, 1), at(values, 2), s); }
+    if (name == "toUpper") => { return eNatCase("toUpper", at(values, 0), s, true); }
+    if (name == "toLower") => { return eNatCase("toLower", at(values, 0), s, false); }
+    if (name == "trim") => { return eNatTrim(at(values, 0), s); }
+    return eNatToInt(at(values, 0), s);
+)
+
+func eNatLength(v, s) => (
+    if (eIsStr(v) || eIsList(v)) => { return [length(v), s]; }
+    return [null, eErr(s, "length expects a string argument or a list, got " + eKind(v))];
+)
+func eNatContains(haystack, needle, s) => (
+    if (eIsStr(haystack)) => {
+        if (eIsStr(needle)) => { return [contains(haystack, needle), s]; }
+        return [null, eErr(s, "contains expects a string argument or a list, got " + eKind(needle))];
+    }
+    if (eIsList(haystack)) => { return [contains(haystack, needle), s]; }
+    return [null, eErr(s, "contains expects a string argument or a list, got " + eKind(haystack))];
+)
+func eNatIndexOf(haystack, needle, s) => (
+    if (eIsStr(haystack)) => {
+        if (eIsStr(needle)) => { return [indexOf(haystack, needle), s]; }
+        return [null, eErr(s, "indexOf expects a string argument or a list, got " + eKind(needle))];
+    }
+    if (eIsList(haystack)) => { return [indexOf(haystack, needle), s]; }
+    return [null, eErr(s, "indexOf expects a string argument or a list, got " + eKind(haystack))];
+)
+func eNatAt(v, i, s) => (
+    if (!eIsList(v)) => { return [null, eErr(s, "at expects a list argument, got " + eKind(v))]; }
+    if (!eIsInt(i)) => { return [null, eErr(s, "at expects an integer argument, got " + eKind(i))]; }
+    if (i < 0 || i >= length(v)) => {
+        return [null, eErr(s, "at index " + toString(i) + " out of bounds for list of length "
+            + toString(length(v)))];
+    }
+    return [at(v, i), s];
+)
+func eNatAppend(v, item, s) => (
+    if (!eIsList(v)) => { return [null, eErr(s, "append expects a list argument, got " + eKind(v))]; }
+    return [append(v, item), s];
+)
+func eNatPrepend(v, item, s) => (
+    if (!eIsList(v)) => { return [null, eErr(s, "prepend expects a list argument, got " + eKind(v))]; }
+    return [prepend(v, item), s];
+)
+func eNatHead(v, s) => (
+    if (!eIsList(v)) => { return [null, eErr(s, "head expects a list argument, got " + eKind(v))]; }
+    if (length(v) == 0) => { return [null, eErr(s, "head of an empty list")]; }
+    return [at(v, 0), s];
+)
+func eNatTail(v, s) => (
+    if (!eIsList(v)) => { return [null, eErr(s, "tail expects a list argument, got " + eKind(v))]; }
+    if (length(v) == 0) => { return [null, eErr(s, "tail of an empty list")]; }
+    return [tail(v), s];
+)
+func eNatReverse(v, s) => (
+    if (eIsStr(v) || eIsList(v)) => { return [reverse(v), s]; }
+    return [null, eErr(s, "reverse expects a string argument or a list, got " + eKind(v))];
+)
+func eNatConcat(left, right, s) => (
+    if (!eIsList(left)) => { return [null, eErr(s, "concat expects a list argument, got " + eKind(left))]; }
+    if (!eIsList(right)) => { return [null, eErr(s, "concat expects a list argument, got " + eKind(right))]; }
+    return [concat(left, right), s];
+)
+func eNatJoin(values, separator, s) => (
+    if (!eIsList(values)) => { return [null, eErr(s, "join expects a list argument, got " + eKind(values))]; }
+    if (!eIsStr(separator)) => {
+        return [null, eErr(s, "join expects a string separator, got " + eKind(separator))];
+    }
+    let i = 0;
+    while (i < length(values)) => {
+        let item = at(values, i);
+        if (!eIsStr(item)) => {
+            return [null, eErr(s, "join expects a list of strings, got " + eKind(item))];
+        }
+        i = i + 1;
+    }
+    return [join(values, separator), s];
+)
+
+func eNatCharAt(v, i, s) => (
+    if (!eIsStr(v)) => { return [null, eErr(s, "charAt expects a string argument, got " + ePyName(v))]; }
+    if (!eIsInt(i)) => { return [null, eErr(s, "charAt expects an integer argument, got " + ePyName(i))]; }
+    if (i < 0 || i >= length(v)) => {
+        return [null, eErr(s, "charAt index " + toString(i) + " out of bounds for string of length "
+            + toString(length(v)))];
+    }
+    return [charAt(v, i), s];
+)
+func eNatSubstring(v, start, end, s) => (
+    if (!eIsStr(v)) => { return [null, eErr(s, "substring expects a string argument, got " + ePyName(v))]; }
+    if (!eIsInt(start)) => { return [null, eErr(s, "substring expects an integer argument, got " + ePyName(start))]; }
+    if (!eIsInt(end)) => { return [null, eErr(s, "substring expects an integer argument, got " + ePyName(end))]; }
+    if (start < 0 || end > length(v) || start > end) => {
+        return [null, eErr(s, "substring range [" + toString(start) + ", " + toString(end)
+            + ") out of bounds for string of length " + toString(length(v)))];
+    }
+    return [substring(v, start, end), s];
+)
+func eNatCase(name, v, s, upper) => (
+    if (!eIsStr(v)) => { return [null, eErr(s, name + " expects a string argument, got " + ePyName(v))]; }
+    if (upper) => { return [toUpper(v), s]; }
+    return [toLower(v), s];
+)
+func eNatTrim(v, s) => (
+    if (!eIsStr(v)) => { return [null, eErr(s, "trim expects a string argument, got " + ePyName(v))]; }
+    return [trim(v), s];
+)
+func eNatToInt(v, s) => (
+    if (!eIsStr(v)) => { return [null, eErr(s, "toInt expects a string argument, got " + ePyName(v))]; }
+    let text = trim(v);
+    if (text == "") => { return [null, eErr(s, "toInt cannot convert an empty string")]; }
+    let sign = 1;
+    let body = text;
+    if (charAt(text, 0) == "+" || charAt(text, 0) == "-") => {
+        if (charAt(text, 0) == "-") => { sign = -1; }
+        body = substring(text, 1, length(text));
+    }
+    if (body == "" || !eAllDigits(body)) => {
+        return [null, eErr(s, "toInt cannot convert '" + v + "' to an integer")];
+    }
+    return [sign * toInt(body), s];
+)
+func eAllDigits(text) => (
+    let i = 0;
+    let ok = true;
+    while (i < length(text)) => {
+        let c = charAt(text, i);
+        if (!(c >= "0" && c <= "9")) => { ok = false; }
+        i = i + 1;
+    }
+    return ok;
+)
+
+// --- Operators ------------------------------------------------------------
+
+func eApplyOp(op, left, right, s) => (
+    if (op == "+") => { return eAddOp(left, right, s); }
+    if (op == "-" || op == "*" || op == "/" || op == "%" || op == "^") => {
+        return eArithmetic(op, left, right, s);
+    }
+    if (op == "==") => { return [left == right, s]; }
+    if (op == "!=") => { return [left != right, s]; }
+    return eRelational(op, left, right, s);
+)
+
+func eAddOp(left, right, s) => (
+    if (eIsStr(left) || eIsStr(right)) => {
+        if (eIsStr(left) && eIsStr(right)) => { return [left + right, s]; }
+        if (eIsNull(left) || eIsNull(right)) => {
+            return [null, eErr(s, "cannot concatenate a string with null")];
+        }
+        return [null, eErr(s, "cannot concatenate a string with a non-string")];
+    }
+    if (eIsList(left) || eIsList(right)) => {
+        if (eIsList(left) && eIsList(right)) => { return [left + right, s]; }
+        return [null, eErr(s, "cannot concatenate a list with a non-list")];
+    }
+    return [left + right, s];
+)
+
+func eArithmetic(op, left, right, s) => (
+    if (eIsList(left) || eIsList(right)) => {
+        return [null, eErr(s, "cannot use '" + op + "' on lists")];
+    }
+    if ((op == "/" || op == "%") && right == 0) => {
+        return [null, eErr(s, "division by zero")];
+    }
+    if (op == "-") => { return [left - right, s]; }
+    if (op == "*") => { return [left * right, s]; }
+    if (op == "/") => { return [left / right, s]; }
+    if (op == "%") => { return [left % right, s]; }
+    return [left ^ right, s];
+)
+
+func eRelational(op, left, right, s) => (
+    if (eIsStr(left) != eIsStr(right)) => {
+        return [null, eErr(s, "cannot compare " + eKind(left) + " with " + eKind(right)
+            + " using '" + op + "'")];
+    }
+    if (eIsList(left) || eIsList(right)) => {
+        return [null, eErr(s, "cannot compare lists using '" + op + "'")];
+    }
+    if (op == "<") => { return [left < right, s]; }
+    if (op == "<=") => { return [left <= right, s]; }
+    if (op == ">") => { return [left > right, s]; }
+    return [left >= right, s];
+)
+
+// --- Expressions ----------------------------------------------------------
+
+func eExpr(node, s) => (
+    let tag = at(node, 0);
+    if (tag == "IntLiteral" || tag == "StringLiteral" || tag == "BoolLiteral") => {
+        return [at(node, 1), s];
+    }
+    if (tag == "NullLiteral") => { return [null, s]; }
+    if (tag == "Identifier") => { return eIdent(at(node, 1), s); }
+    if (tag == "ListLiteral") => { return eListLiteral(at(node, 1), s); }
+    if (tag == "Call") => { return eCall(at(node, 1), at(node, 2), s); }
+    if (tag == "Unary") => { return eUnary(node, s); }
+    if (tag == "Conditional") => { return eConditional(node, s); }
+    if (tag == "Binary") => { return eBinary(node, s); }
+    return [null, eErr(s, "cannot evaluate expression")];
+)
+
+func eIdent(name, s) => (
+    if (!eHas(eEnv(s), name)) => {
+        return [null, eErr(s, "undefined variable '" + name + "'")];
+    }
+    return [eLookup(eEnv(s), name), s];
+)
+
+func eListLiteral(elements, s) => (
+    let values = [];
+    let st = s;
+    let i = 0;
+    while (i < length(elements) && eStatus(st) == 0) => {
+        let v = eExpr(at(elements, i), st);
+        values = append(values, eVal(v));
+        st = eSt(v);
+        i = i + 1;
+    }
+    return [values, st];
+)
+
+func eUnary(node, s) => (
+    let operand = eExpr(at(node, 2), s);
+    if (eStatus(eSt(operand)) != 0) => { return [null, eSt(operand)]; }
+    if (at(node, 1) == "-") => { return [0 - eVal(operand), eSt(operand)]; }
+    return [!eTruthy(eVal(operand)), eSt(operand)];
+)
+
+func eConditional(node, s) => (
+    let condition = eExpr(at(node, 1), s);
+    if (eStatus(eSt(condition)) != 0) => { return [null, eSt(condition)]; }
+    if (eTruthy(eVal(condition))) => { return eExpr(at(node, 2), eSt(condition)); }
+    return eExpr(at(node, 3), eSt(condition));
+)
+
+func eBinary(node, s) => (
+    let left = eExpr(at(node, 1), s);
+    if (eStatus(eSt(left)) != 0) => { return [null, eSt(left)]; }
+    let op = at(node, 2);
+    if (op == "&&") => {
+        if (!eTruthy(eVal(left))) => { return [false, eSt(left)]; }
+        let right = eExpr(at(node, 3), eSt(left));
+        if (eStatus(eSt(right)) != 0) => { return [null, eSt(right)]; }
+        return [eTruthy(eVal(right)), eSt(right)];
+    }
+    if (op == "||") => {
+        if (eTruthy(eVal(left))) => { return [true, eSt(left)]; }
+        let right = eExpr(at(node, 3), eSt(left));
+        if (eStatus(eSt(right)) != 0) => { return [null, eSt(right)]; }
+        return [eTruthy(eVal(right)), eSt(right)];
+    }
+    let right = eExpr(at(node, 3), eSt(left));
+    if (eStatus(eSt(right)) != 0) => { return [null, eSt(right)]; }
+    return eApplyOp(op, eVal(left), eVal(right), eSt(right));
+)
+
+// --- Statements -----------------------------------------------------------
+// eStatement returns [changed, value, state]; `changed` says whether the
+// statement produced a new block result (matching the host, where only
+// expression statements and control flow update the last value).
+
+func eStatements(statements, s) => (
+    let result = null;
+    let st = s;
+    let i = 0;
+    while (i < length(statements) && eStatus(st) == 0) => {
+        let one = eStatement(at(statements, i), st);
+        if (at(one, 0)) => { result = at(one, 1); }
+        st = at(one, 2);
+        i = i + 1;
+    }
+    return [result, st];
+)
+
+func eStatement(node, s) => (
+    let tag = at(node, 0);
+    if (tag == "LetStmt") => {
+        let name = at(node, 1);
+        if (eHas(eEnv(s), name)) => {
+            return [false, null, eErr(s, "variable '" + name + "' is already declared")];
+        }
+        let v = eExpr(at(node, 2), s);
+        if (eStatus(eSt(v)) != 0) => { return [false, null, eSt(v)]; }
+        return [false, null, eState(eAdd(eEnv(eSt(v)), name, eVal(v)), eOut(eSt(v)), 0,
+            null, eFuncs(eSt(v)))];
+    }
+    if (tag == "AssignStmt") => {
+        let name = at(node, 1);
+        if (!eHas(eEnv(s), name)) => {
+            return [false, null, eErr(s, "undefined variable '" + name + "'")];
+        }
+        let v = eExpr(at(node, 2), s);
+        if (eStatus(eSt(v)) != 0) => { return [false, null, eSt(v)]; }
+        return [false, null, eState(eSet(eEnv(eSt(v)), name, eVal(v)), eOut(eSt(v)), 0,
+            null, eFuncs(eSt(v)))];
+    }
+    if (tag == "IncrementStmt") => {
+        let name = at(node, 1);
+        if (!eHas(eEnv(s), name)) => {
+            return [false, null, eErr(s, "undefined variable '" + name + "'")];
+        }
+        let value = eLookup(eEnv(s), name);
+        if (!eIsInt(value)) => {
+            return [false, null, eErr(s, "cannot increment non-integer variable '" + name + "'")];
+        }
+        return [false, null, eState(eSet(eEnv(s), name, value + 1), eOut(s), 0,
+            null, eFuncs(s))];
+    }
+    if (tag == "IfStmt") => { return eIfStmt(node, s); }
+    if (tag == "WhileStmt") => { return eWhileStmt(node, s); }
+    if (tag == "ForStmt") => { return eForStmt(node, s); }
+    if (tag == "ReturnStmt") => {
+        let v = eExpr(at(node, 1), s);
+        if (eStatus(eSt(v)) != 0) => { return [false, null, eSt(v)]; }
+        return [false, null, eRet(eSt(v), eVal(v))];
+    }
+    if (tag == "ExprStmt") => {
+        let v = eExpr(at(node, 1), s);
+        if (eStatus(eSt(v)) != 0) => { return [false, null, eSt(v)]; }
+        return [true, eVal(v), eSt(v)];
+    }
+    return [false, null, eErr(s, "cannot evaluate statement")];
+)
+
+func eScoped(statements, s) => (
+    let outer = eEnv(s);
+    let result = eStatements(statements, s);
+    let inner = eEnv(eSt(result));
+    let env = outer;
+    let i = 0;
+    while (i < length(outer)) => {
+        let name = at(at(outer, i), 0);
+        if (eHas(inner, name)) => { env = eSet(env, name, eLookup(inner, name)); }
+        i = i + 1;
+    }
+    return [eVal(result), eState(env, eOut(eSt(result)), eStatus(eSt(result)),
+        eArg(eSt(result)), eFuncs(eSt(result)))];
+)
+
+func eIfStmt(node, s) => (
+    let condition = eExpr(at(node, 1), s);
+    if (eStatus(eSt(condition)) != 0) => { return [false, null, eSt(condition)]; }
+    let elseBranch = at(node, 3);
+    if (eTruthy(eVal(condition))) => {
+        let scoped = eScoped(at(node, 2), eSt(condition));
+        return [true, eVal(scoped), eSt(scoped)];
+    }
+    if (elseBranch == null) => { return [false, null, eSt(condition)]; }
+    if (at(elseBranch, 0) == "IfStmt") => {
+        let scoped = eScoped([elseBranch], eSt(condition));
+        return [true, eVal(scoped), eSt(scoped)];
+    }
+    let scoped = eScoped(elseBranch, eSt(condition));
+    return [true, eVal(scoped), eSt(scoped)];
+)
+
+func eWhileStmt(node, s) => (
+    let st = s;
+    let changed = false;
+    let result = null;
+    let iterations = 0;
+    let done = 0;
+    while (done == 0) => {
+        if (eStatus(st) != 0) => { done = 1; }
+        else => {
+            let condition = eExpr(at(node, 1), st);
+            if (eStatus(eSt(condition)) != 0) => { st = eSt(condition); done = 1; }
+            else => {
+                if (!eTruthy(eVal(condition))) => { done = 1; }
+                else => {
+                    if (iterations >= 1000000) => {
+                        st = eErr(eSt(condition), "loop exceeded maximum iteration count");
+                        done = 1;
+                    } else => {
+                        let scoped = eScoped(at(node, 2), eSt(condition));
+                        st = eSt(scoped);
+                        result = eVal(scoped);
+                        changed = true;
+                        iterations = iterations + 1;
+                    }
+                }
+            }
+        }
+    }
+    return [changed, result, st];
+)
+
+func eForStmt(node, s) => (
+    let initialized = eStatements([at(node, 1)], s);
+    let st = eSt(initialized);
+    let outer = eEnv(s);
+    let changed = false;
+    let result = null;
+    let iterations = 0;
+    let done = 0;
+    while (done == 0) => {
+        if (eStatus(st) != 0) => { done = 1; }
+        else => {
+            let condition = eExpr(at(node, 2), st);
+            if (eStatus(eSt(condition)) != 0) => { st = eSt(condition); done = 1; }
+            else => {
+                if (!eTruthy(eVal(condition))) => { done = 1; }
+                else => {
+                    if (iterations >= 1000000) => {
+                        st = eErr(eSt(condition), "loop exceeded maximum iteration count");
+                        done = 1;
+                    } else => {
+                        let scoped = eScoped(at(node, 4), eSt(condition));
+                        st = eSt(scoped);
+                        result = eVal(scoped);
+                        changed = true;
+                        iterations = iterations + 1;
+                        let incremented = eStatements([at(node, 3)], st);
+                        st = eSt(incremented);
+                    }
+                }
+            }
+        }
+    }
+    let finalEnv = eEnv(st);
+    let env = outer;
+    let i = 0;
+    while (i < length(outer)) => {
+        let name = at(at(outer, i), 0);
+        if (eHas(finalEnv, name)) => { env = eSet(env, name, eLookup(finalEnv, name)); }
+        i = i + 1;
+    }
+    return [changed, result, eState(env, eOut(st), eStatus(st), eArg(st), eFuncs(st))];
+)

@@ -1,0 +1,622 @@
+// Serenity bootstrap: parser
+//
+// The second stage of bootstrapping the Serenity compiler in itself. This
+// module re-implements src/parser.py as ordinary Serenity functions and
+// consumes the bootstrap scanner's [type, lexeme, line, column] token lists
+// (see scanner.srn) to build a tree of nested-list nodes that a future
+// self-hosted evaluator can walk. Any token list the scanner produces parses
+// interchangeably with the host parser's.
+//
+// Contract:
+//   parse(tokens) -> Program node
+//
+// Tree shape, mirroring the src/ast_nodes.py dataclasses exactly:
+//   Program       ["Program", [function, ...]]
+//   Function      ["Function", name, [param, ...], [statement, ...]]
+//   ExprStmt      ["ExprStmt", expression]
+//   LetStmt       ["LetStmt", name, initializer]
+//   AssignStmt    ["AssignStmt", name, value]
+//   IfStmt        ["IfStmt", condition, [statement, ...], else]
+//                 where else is null, a statement list, or an IfStmt node
+//   WhileStmt     ["WhileStmt", condition, [statement, ...]]
+//   ForStmt       ["ForStmt", initializer, condition, increment, [statement, ...]]
+//   IncrementStmt ["IncrementStmt", name]
+//   ReturnStmt    ["ReturnStmt", expression]
+//   IntLiteral    ["IntLiteral", value]
+//   StringLiteral ["StringLiteral", value]
+//   BoolLiteral   ["BoolLiteral", value]
+//   NullLiteral   ["NullLiteral"]
+//   Identifier    ["Identifier", name]
+//   Binary        ["Binary", left, operator, right]
+//   Unary         ["Unary", operator, operand]
+//   Conditional   ["Conditional", condition, if_true, if_false]
+//   Call          ["Call", callee, [argument, ...]]
+//   ListLiteral   ["ListLiteral", [element, ...]]
+//
+// Errors cannot raise in Serenity: where the host parser raises ParseError
+// the bootstrap parser prints "PARSE ERROR: ..." and fails the whole parse,
+// returning an empty ["Program", []] (the analogue of `raise` on the first
+// error). Because there is no mutable state, the cursor and a "failed" flag
+// are threaded through every parse function as [tokens, index, failed];
+// each returns [node, state].
+//
+// NOTE on naming: every helper is prefixed `p` (parse) so this module can be
+// inlined alongside scanner.srn and the stdlib modules without clashing with
+// their own `advance`, `peek`, etc. Token type IDs are the ones scanner.srn
+// documents (1..43).
+
+func parse(tokens) => (
+    let s = pState(tokens, 0, false);
+    let funcs = [];
+    let done = 0;
+    let bad = false;
+    while (done == 0) => {
+        if (bad) => { done = 1; }
+        else => {
+            if (pFailed(s)) => { done = 1; bad = true; }
+            else => {
+                if (pAtEnd(s)) => { done = 1; }
+                else => {
+                    let f = pFunction(s);
+                    if (pBad(f)) => { done = 1; bad = true; }
+                    else => {
+                        funcs = append(funcs, pNode(f));
+                        s = pTail(f);
+                    }
+                }
+            }
+        }
+    }
+    if (bad) => { return ["Program", []]; }
+    return ["Program", funcs];
+)
+
+// --- State and pair helpers -----------------------------------------------
+// A state is [tokens, index, failed]. A parse function returns [node, state].
+
+func pState(toks, cur, failed) => (
+    return [toks, cur, failed];
+)
+func pToks(s) => (
+    return at(s, 0);
+)
+func pCur(s) => (
+    return at(s, 1);
+)
+func pFailed(s) => (
+    return at(s, 2);
+)
+func pNode(p) => (
+    return at(p, 0);
+)
+func pTail(p) => (
+    return at(p, 1);
+)
+func pBad(p) => (
+    return pFailed(pTail(p));
+)
+
+// --- Token helpers --------------------------------------------------------
+
+func pTType(t) => (
+    return at(t, 0);
+)
+func pTLex(t) => (
+    return at(t, 1);
+)
+func pTLine(t) => (
+    return at(t, 2);
+)
+func pTCol(t) => (
+    return at(t, 3);
+)
+func pPeekTok(s) => (
+    return at(pToks(s), pCur(s));
+)
+func pPeekNext(s) => (
+    let n = pCur(s) + 1;
+    if (n >= length(pToks(s))) => { n = length(pToks(s)) - 1; }
+    return at(pToks(s), n);
+)
+func pAtEnd(s) => (
+    return pCur(s) + 1 >= length(pToks(s));
+)
+
+// --- Cursor primitives ----------------------------------------------------
+
+func pAdvance(s) => (
+    if (pFailed(s) || pAtEnd(s)) => { return [null, s]; }
+    let toks = pToks(s);
+    let cur = pCur(s);
+    return [at(toks, cur), pState(toks, cur + 1, false)];
+)
+
+func pTake(s, types) => (
+    // Returns [matched token, state] if the current token type is in TYPES,
+    // otherwise [false, state] without consuming.
+    if (pFailed(s)) => { return [false, s]; }
+    let tok = pPeekTok(s);
+    if (contains(types, pTType(tok))) => { return pAdvance(s); }
+    else => { return [false, s]; }
+)
+
+func pHas(s, types) => (
+    if (pFailed(s)) => { return false; }
+    return contains(types, pTType(pPeekTok(s)));
+)
+
+func pRequire(s, typeId, message) => (
+    if (pFailed(s)) => { return [null, s]; }
+    let tok = pPeekTok(s);
+    if (pTType(tok) == typeId) => { return pAdvance(s); }
+    else => { return pError(s, message); }
+)
+
+func pError(s, message) => (
+    let tok = pPeekTok(s);
+    println("PARSE ERROR: " + toString(pTLine(tok)) + ":" + toString(pTCol(tok)) + ": " + message + "; found '" + pTLex(tok) + "'");
+    return [null, pState(pToks(s), pCur(s), true)];
+)
+
+func pFail(s, message) => (
+    println("PARSE ERROR: " + message);
+    return [null, pState(pToks(s), pCur(s), true)];
+)
+
+// --- Grammar --------------------------------------------------------------
+
+func pFunction(s) => (
+    let a = pRequire(s, 1, "expected 'func'");
+    if (pBad(a)) => { return a; }
+    let b = pRequire(pTail(a), 6, "expected function name");
+    if (pBad(b)) => { return b; }
+    let name = pTLex(pNode(b));
+    let c = pRequire(pTail(b), 9, "expected '(' after function name");
+    if (pBad(c)) => { return c; }
+    let params = [];
+    let st = pTail(c);
+    if (!pHas(st, [10])) => {
+        let pl = pParams(st);
+        if (pBad(pl)) => { return pl; }
+        params = pNode(pl);
+        st = pTail(pl);
+    }
+    let d = pRequire(st, 10, "expected ')' after parameters");
+    if (pBad(d)) => { return d; }
+    let e = pRequire(pTail(d), 40, "expected '=>' after function signature");
+    if (pBad(e)) => { return e; }
+    let f = pRequire(pTail(e), 9, "expected '(' to start function body");
+    if (pBad(f)) => { return f; }
+    let body = pStmts(pTail(f), 10);
+    if (pBad(body)) => { return body; }
+    let g = pAdvance(pTail(body));
+    return [["Function", name, params, pNode(body)], pTail(g)];
+)
+
+func pParams(s) => (
+    let params = [];
+    let st = s;
+    let done = 0;
+    while (done == 0) => {
+        if (pFailed(st)) => { done = 1; }
+        else => {
+            let c = pRequire(st, 6, "expected parameter name");
+            if (pBad(c)) => { st = pTail(c); done = 1; }
+            else => {
+                params = append(params, pTLex(pNode(c)));
+                let m = pTake(pTail(c), [11]);
+                st = pTail(m);
+                if (!pNode(m)) => { done = 1; }
+            }
+        }
+    }
+    return [params, st];
+)
+
+func pStmts(s, termType) => (
+    let body = [];
+    let st = s;
+    let done = 0;
+    while (done == 0) => {
+        if (pFailed(st)) => { done = 1; }
+        else => {
+            if (pTType(pPeekTok(st)) == termType) => { done = 1; }
+            else => {
+                if (pAtEnd(st)) => {
+                    let f = pFail(st, "unexpected end of file in block");
+                    st = pTail(f);
+                    done = 1;
+                } else => {
+                    let stmt = pStatement(st);
+                    if (pBad(stmt)) => { st = pTail(stmt); done = 1; }
+                    else => {
+                        let node = pNode(stmt);
+                        body = append(body, node);
+                        if (pBlockStmt(node)) => {
+                            st = pTail(pTake(pTail(stmt), [12]));
+                        } else => {
+                            let c = pRequire(pTail(stmt), 12, "expected ';' after statement");
+                            st = pTail(c);
+                            if (pFailed(st)) => { done = 1; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return [body, st];
+)
+
+func pBlockStmt(node) => (
+    if (at(node, 0) == "IfStmt") => { return true; }
+    else => { if (at(node, 0) == "WhileStmt") => { return true; }
+    else => { if (at(node, 0) == "ForStmt") => { return true; }
+    else => { return false; } } }
+)
+
+func pInitOp(s) => (
+    let m = pTake(s, [34, 41]);
+    if (pNode(m)) => { return [null, pTail(m)]; }
+    return pError(s, "expected '=' or ':=' after variable name");
+)
+
+func pStatement(s) => (
+    let m = pTake(s, [2]);
+    if (pNode(m)) => {
+        let a = pRequire(pTail(m), 6, "expected variable name after 'let'");
+        if (pBad(a)) => { return a; }
+        let name = pTLex(pNode(a));
+        let b = pInitOp(pTail(a));
+        if (pBad(b)) => { return b; }
+        let e = pExpr(pTail(b));
+        if (pBad(e)) => { return e; }
+        return [["LetStmt", name, pNode(e)], pTail(e)];
+    }
+    let mi = pTake(s, [35]);
+    if (pNode(mi)) => { return pIfStmt(pTail(mi)); }
+    let mw = pTake(s, [37]);
+    if (pNode(mw)) => { return pWhileStmt(pTail(mw)); }
+    let mf = pTake(s, [38]);
+    if (pNode(mf)) => { return pForStmt(pTail(mf)); }
+    if (pHas(s, [6]) && pTType(pPeekNext(s)) == 39) => {
+        let a = pAdvance(s);
+        let b = pAdvance(pTail(a));
+        return [["IncrementStmt", pTLex(pNode(a))], pTail(b)];
+    }
+    if (pHas(s, [6]) && pTType(pPeekNext(s)) == 34) => {
+        let a = pAdvance(s);
+        let b = pAdvance(pTail(a));
+        let e = pExpr(pTail(b));
+        if (pBad(e)) => { return e; }
+        return [["AssignStmt", pTLex(pNode(a)), pNode(e)], pTail(e)];
+    }
+    let mr = pTake(s, [42]);
+    if (pNode(mr)) => {
+        let e = pExpr(pTail(mr));
+        if (pBad(e)) => { return e; }
+        return [["ReturnStmt", pNode(e)], pTail(e)];
+    }
+    let e = pExpr(s);
+    if (pBad(e)) => { return e; }
+    return [["ExprStmt", pNode(e)], pTail(e)];
+)
+
+func pBlock(s, description) => (
+    let a = pRequire(s, 40, "expected '=>' after " + description);
+    if (pBad(a)) => { return a; }
+    let b = pRequire(pTail(a), 28, "expected '{' to start block");
+    if (pBad(b)) => { return b; }
+    let body = pStmts(pTail(b), 29);
+    if (pBad(body)) => { return body; }
+    let c = pAdvance(pTail(body));
+    return [pNode(body), pTail(c)];
+)
+
+func pWhileStmt(s) => (
+    let a = pRequire(s, 9, "expected '(' after 'while'");
+    if (pBad(a)) => { return a; }
+    let cond = pExpr(pTail(a));
+    if (pBad(cond)) => { return cond; }
+    let b = pRequire(pTail(cond), 10, "expected ')' after while condition");
+    if (pBad(b)) => { return b; }
+    let body = pBlock(pTail(b), "while condition");
+    if (pBad(body)) => { return body; }
+    return [["WhileStmt", pNode(cond), pNode(body)], pTail(body)];
+)
+
+func pForStmt(s) => (
+    let a = pRequire(s, 9, "expected '(' after 'for'");
+    if (pBad(a)) => { return a; }
+    let b = pRequire(pTail(a), 2, "expected 'let' declaration in for initializer");
+    if (pBad(b)) => { return b; }
+    let c = pRequire(pTail(b), 6, "expected loop variable name");
+    if (pBad(c)) => { return c; }
+    let name = pTLex(pNode(c));
+    let d = pInitOp(pTail(c));
+    if (pBad(d)) => { return d; }
+    let initE = pExpr(pTail(d));
+    if (pBad(initE)) => { return initE; }
+    let init = ["LetStmt", name, pNode(initE)];
+    let e = pRequire(pTail(initE), 12, "expected ';' after for initializer");
+    if (pBad(e)) => { return e; }
+    let cond = pExpr(pTail(e));
+    if (pBad(cond)) => { return cond; }
+    let f = pRequire(pTail(cond), 12, "expected ';' after for condition");
+    if (pBad(f)) => { return f; }
+    let g = pRequire(pTail(f), 6, "expected increment variable");
+    if (pBad(g)) => { return g; }
+    let incName = pTLex(pNode(g));
+    let h = pRequire(pTail(g), 39, "expected '++' in for increment");
+    if (pBad(h)) => { return h; }
+    let i = pRequire(pTail(h), 10, "expected ')' after for clauses");
+    if (pBad(i)) => { return i; }
+    let st = pTail(i);
+    if (pHas(st, [40])) => {
+        let body = pBlock(st, "for clauses");
+        if (pBad(body)) => { return body; }
+        return [["ForStmt", init, pNode(cond), ["IncrementStmt", incName], pNode(body)], pTail(body)];
+    } else => {
+        return pError(st, "expected '=>' after for clauses");
+    }
+)
+
+func pIfStmt(s) => (
+    let a = pRequire(s, 9, "expected '(' after 'if'");
+    if (pBad(a)) => { return a; }
+    let cond = pExpr(pTail(a));
+    if (pBad(cond)) => { return cond; }
+    let b = pRequire(pTail(cond), 10, "expected ')' after if condition");
+    if (pBad(b)) => { return b; }
+    let c = pRequire(pTail(b), 40, "expected '=>' after if condition");
+    if (pBad(c)) => { return c; }
+    let d = pRequire(pTail(c), 28, "expected '{' to start if branch");
+    if (pBad(d)) => { return d; }
+    let thenB = pStmts(pTail(d), 29);
+    if (pBad(thenB)) => { return thenB; }
+    let e = pAdvance(pTail(thenB));
+    let after = pTail(e);
+    let m = pTake(after, [36]);
+    if (pNode(m)) => {
+        let mi = pTake(pTail(m), [35]);
+        if (pNode(mi)) => {
+            let nested = pIfStmt(pTail(mi));
+            if (pBad(nested)) => { return nested; }
+            return [["IfStmt", pNode(cond), pNode(thenB), pNode(nested)], pTail(nested)];
+        }
+        let f = pRequire(pTail(mi), 40, "expected '=>' after 'else'");
+        if (pBad(f)) => { return f; }
+        let g = pRequire(pTail(f), 28, "expected '{' to start else branch");
+        if (pBad(g)) => { return g; }
+        let elseB = pStmts(pTail(g), 29);
+        if (pBad(elseB)) => { return elseB; }
+        let h = pAdvance(pTail(elseB));
+        return [["IfStmt", pNode(cond), pNode(thenB), pNode(elseB)], pTail(h)];
+    }
+    return [["IfStmt", pNode(cond), pNode(thenB), null], after];
+)
+
+// --- Expressions ----------------------------------------------------------
+
+func pExpr(s) => (
+    let e = pOr(s);
+    if (pBad(e)) => { return e; }
+    let m = pTake(pTail(e), [32]);
+    if (pNode(m)) => {
+        let t = pExpr(pTail(m));
+        if (pBad(t)) => { return t; }
+        let c = pRequire(pTail(t), 33, "expected ':' in conditional expression");
+        if (pBad(c)) => { return c; }
+        let f = pExpr(pTail(c));
+        if (pBad(f)) => { return f; }
+        return [["Conditional", pNode(e), pNode(t), pNode(f)], pTail(f)];
+    }
+    return e;
+)
+
+func pOr(s) => (
+    let first = pAnd(s);
+    if (pBad(first)) => { return first; }
+    let expr = pNode(first);
+    let st = pTail(first);
+    let done = 0;
+    while (done == 0) => {
+        let m = pTake(st, [27]);
+        if (pNode(m)) => {
+            let rhs = pAnd(pTail(m));
+            if (pBad(rhs)) => { return rhs; }
+            expr = ["Binary", expr, pTLex(pNode(m)), pNode(rhs)];
+            st = pTail(rhs);
+        } else => { done = 1; }
+    }
+    return [expr, st];
+)
+
+func pAnd(s) => (
+    let first = pEquality(s);
+    if (pBad(first)) => { return first; }
+    let expr = pNode(first);
+    let st = pTail(first);
+    let done = 0;
+    while (done == 0) => {
+        let m = pTake(st, [26]);
+        if (pNode(m)) => {
+            let rhs = pEquality(pTail(m));
+            if (pBad(rhs)) => { return rhs; }
+            expr = ["Binary", expr, pTLex(pNode(m)), pNode(rhs)];
+            st = pTail(rhs);
+        } else => { done = 1; }
+    }
+    return [expr, st];
+)
+
+func pEquality(s) => (
+    let first = pComparison(s);
+    if (pBad(first)) => { return first; }
+    let expr = pNode(first);
+    let st = pTail(first);
+    let done = 0;
+    while (done == 0) => {
+        let m = pTake(st, [21, 20]);
+        if (pNode(m)) => {
+            let rhs = pComparison(pTail(m));
+            if (pBad(rhs)) => { return rhs; }
+            expr = ["Binary", expr, pTLex(pNode(m)), pNode(rhs)];
+            st = pTail(rhs);
+        } else => { done = 1; }
+    }
+    return [expr, st];
+)
+
+func pComparison(s) => (
+    let first = pAddition(s);
+    if (pBad(first)) => { return first; }
+    let expr = pNode(first);
+    let st = pTail(first);
+    let done = 0;
+    while (done == 0) => {
+        let m = pTake(st, [22, 23, 24, 25]);
+        if (pNode(m)) => {
+            let rhs = pAddition(pTail(m));
+            if (pBad(rhs)) => { return rhs; }
+            expr = ["Binary", expr, pTLex(pNode(m)), pNode(rhs)];
+            st = pTail(rhs);
+        } else => { done = 1; }
+    }
+    return [expr, st];
+)
+
+func pAddition(s) => (
+    let first = pMultiplication(s);
+    if (pBad(first)) => { return first; }
+    let expr = pNode(first);
+    let st = pTail(first);
+    let done = 0;
+    while (done == 0) => {
+        let m = pTake(st, [13, 14]);
+        if (pNode(m)) => {
+            let rhs = pMultiplication(pTail(m));
+            if (pBad(rhs)) => { return rhs; }
+            expr = ["Binary", expr, pTLex(pNode(m)), pNode(rhs)];
+            st = pTail(rhs);
+        } else => { done = 1; }
+    }
+    return [expr, st];
+)
+
+func pMultiplication(s) => (
+    let first = pPower(s);
+    if (pBad(first)) => { return first; }
+    let expr = pNode(first);
+    let st = pTail(first);
+    let done = 0;
+    while (done == 0) => {
+        let m = pTake(st, [15, 16, 17]);
+        if (pNode(m)) => {
+            let rhs = pPower(pTail(m));
+            if (pBad(rhs)) => { return rhs; }
+            expr = ["Binary", expr, pTLex(pNode(m)), pNode(rhs)];
+            st = pTail(rhs);
+        } else => { done = 1; }
+    }
+    return [expr, st];
+)
+
+func pPower(s) => (
+    let left = pUnary(s);
+    if (pBad(left)) => { return left; }
+    let m = pTake(pTail(left), [18]);
+    if (pNode(m)) => {
+        let right = pPower(pTail(m));
+        if (pBad(right)) => { return right; }
+        return [["Binary", pNode(left), "^", pNode(right)], pTail(right)];
+    }
+    return left;
+)
+
+func pUnary(s) => (
+    let m = pTake(s, [14, 19]);
+    if (pNode(m)) => {
+        let operand = pUnary(pTail(m));
+        if (pBad(operand)) => { return operand; }
+        return [["Unary", pTLex(pNode(m)), pNode(operand)], pTail(operand)];
+    }
+    return pPrimary(s);
+)
+
+func pItems(s, termType) => (
+    // Comma-separated expressions ending before TERMTYPE (never called when
+    // the terminator is already the current token).
+    let items = [];
+    let st = s;
+    let done = 0;
+    while (done == 0) => {
+        if (pFailed(st)) => { done = 1; }
+        else => {
+            let e = pExpr(st);
+            if (pBad(e)) => { st = pTail(e); done = 1; }
+            else => {
+                items = append(items, pNode(e));
+                let m = pTake(pTail(e), [11]);
+                st = pTail(m);
+                if (!pNode(m)) => { done = 1; }
+            }
+        }
+    }
+    return [items, st];
+)
+
+func pPrimary(s) => (
+    let mInt = pTake(s, [7]);
+    if (pNode(mInt)) => { return [["IntLiteral", toInt(pTLex(pNode(mInt)))], pTail(mInt)]; }
+    let mStr = pTake(s, [8]);
+    if (pNode(mStr)) => { return [["StringLiteral", pTLex(pNode(mStr))], pTail(mStr)]; }
+    let mTrue = pTake(s, [3]);
+    if (pNode(mTrue)) => { return [["BoolLiteral", true], pTail(mTrue)]; }
+    let mFalse = pTake(s, [4]);
+    if (pNode(mFalse)) => { return [["BoolLiteral", false], pTail(mFalse)]; }
+    let mNull = pTake(s, [5]);
+    if (pNode(mNull)) => { return [["NullLiteral"], pTail(mNull)]; }
+    let mList = pTake(s, [30]);
+    if (pNode(mList)) => {
+        let st = pTail(mList);
+        let elems = [];
+        if (!pHas(st, [31])) => {
+            let items = pItems(st, 31);
+            if (pBad(items)) => { return items; }
+            elems = pNode(items);
+            st = pTail(items);
+        }
+        let close = pRequire(st, 31, "expected ']' after list elements");
+        if (pBad(close)) => { return close; }
+        return [["ListLiteral", elems], pTail(close)];
+    }
+    let mId = pTake(s, [6]);
+    if (pNode(mId)) => {
+        let name = pTLex(pNode(mId));
+        let st = pTail(mId);
+        let mc = pTake(st, [9]);
+        if (pNode(mc)) => {
+            let st2 = pTail(mc);
+            let args = [];
+            if (!pHas(st2, [10])) => {
+                let items = pItems(st2, 10);
+                if (pBad(items)) => { return items; }
+                args = pNode(items);
+                st2 = pTail(items);
+            }
+            let close = pRequire(st2, 10, "expected ')' after arguments");
+            if (pBad(close)) => { return close; }
+            return [["Call", name, args], pTail(close)];
+        }
+        return [["Identifier", name], st];
+    }
+    let mGroup = pTake(s, [9]);
+    if (pNode(mGroup)) => {
+        let inner = pExpr(pTail(mGroup));
+        if (pBad(inner)) => { return inner; }
+        let close = pRequire(pTail(inner), 10, "expected ')' after expression");
+        if (pBad(close)) => { return close; }
+        return [pNode(inner), pTail(close)];
+    }
+    return pError(s, "expected expression");
+)

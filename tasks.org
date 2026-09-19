@@ -64,7 +64,7 @@
 - I have no idea how to do this.
 
 * TODO Bootstrap the Serenity language in itself
-** TODO Upgrade the standard library
+** DONE Upgrade the standard library
 - Added an immutable list type: `[a, b, c]` literals, polymorphic collection
   builtins (`length`, `contains`, `indexOf`, `reverse`), list builtins (`at`,
   `append`, `prepend`, `head`, `tail`, `concat`, `join`, `toString`), list
@@ -78,4 +78,58 @@
 - Added `tests/test_lists.py` (45 tests); full suite is 165 tests and green.
 - Removed `reverse`/`reverseRest` from `stdlib/string.srn` in favour of the
   polymorphic `reverse` builtin.
-** TODO Start building
+** DONE Start building - self-hosted scanner
+- Added bootstrap/scanner.srn, a Serenity reimplementation of src/scanner.py.
+  - scan(source) returns a list of [type, lexeme, line, column] token values.
+  - Token type IDs mirror the host TokenType enum exactly, so a parser can
+    consume either token stream interchangeably.
+  - Errors cannot raise in Serenity: the scanner prints "SCAN ERROR: ..." and
+    recovers with a type-0 ERROR token where the host scanner raises.
+- Added tests/test_bootstrap.py (9 tests). Parity tests run both scanners over
+  the same text and assert byte-for-byte identical token dumps; error tests pin
+  the recovery behaviour; and the scanner tokenises its own source identically
+  to the host scanner (first self-hosting milestone). Full suite is 173 tests
+  and green.
+** DONE Start building - self-hosted parser
+- Added bootstrap/parser.srn, a Serenity reimplementation of src/parser.py.
+  - parse(tokens) returns a nested-list Program node; node tags mirror the
+    src/ast_nodes.py dataclass names exactly, so a future self-hosted
+    evaluator can walk the tree.
+  - Consumes the bootstrap scanner's [type, lexeme, line, column] token
+    lists interchangeably with the host parser's token objects.
+  - Cursor state is threaded as [tokens, index, failed]; each parse
+    function returns [node, state]. Errors cannot raise in Serenity, so
+    the parser prints "PARSE ERROR: ..." and fails the whole parse with an
+    empty ["Program", []] where the host parser raises ParseError.
+  - Every helper is prefixed `p` so this module can be inlined alongside
+    scanner.srn and the stdlib modules without clashing.
+- Added tests: a 28-program parity corpus (byte-for-byte identical tree
+  dumps), 12 error-recovery pins, and the parser parses its own source
+  identically to the host parser (second self-hosting milestone). Full
+  suite is 189 tests and green.
+** DONE Start building - self-hosted evaluator
+- Added bootstrap/evaluator.srn, a Serenity reimplementation of src/evaluator.py
+  (plus the runtime semantics of src/binary_ops.py, src/list_builtins.py and
+  src/string_builtins.py).
+  - eInterpret(program) returns [result, state]; the state is
+    [env, output, status, arg, functions] with status 0 = ok, 1 = return,
+    2 = runtime error, 3 = exit. Runtime lists are the shared tuple
+    representation; native builtins are dispatched by name, and errors
+    cannot raise, so the evaluator sets status 2 and records the message
+    where the host raises.
+  - Every helper is prefixed `e` (functions `eFn`, `eUserCall`, `eBinary`,
+    `eNative`, ...) so it can be inlined alongside scanner.srn and
+    parser.srn without clashing.
+- Added tests: a 30-program parity corpus (byte-for-byte identical output
+  against the host evaluator), runtime-error pins matching the host's
+  OperationError text, `exit` halting, and the full scanner+parser+evaluator
+  pipeline interpreting its own source (the third self-hosting milestone).
+  Full suite is 201 tests and green.
+- Notes: the bootstrap driver must run with a raised Python recursion limit
+  (sys.setrecursionlimit) because interpreting the multi-thousand-line driver
+  nests interpreter frames beyond CPython's default 1000. Mixed-type operators
+  the host cannot evaluate (e.g. `null + 1`) crash the host with a TypeError
+  and are out of scope for error pins.
+** TODO Start building - self-hosted code generator
+- Reimplement src/code_generator.py in Serenity, walking the bootstrap
+  parser's nested-list tree to emit ARM64 assembly.

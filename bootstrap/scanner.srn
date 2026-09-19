@@ -1,0 +1,330 @@
+// Serenity bootstrap: scanner
+//
+// The first stage of bootstrapping the Serenity compiler in itself. This
+// module re-implements src/scanner.py as ordinary Serenity functions and is
+// the source of truth for later bootstrap stages (parser, evaluator, code
+// generator).
+//
+// Contract:
+//   scan(source) -> list of token values [type, lexeme, line, column]
+//
+// Token type IDs mirror src/scanner.py's TokenType enum (1-based) and are
+// looked up via tokenId/name-of-token. Type 0 is the ERROR token used to
+// surface scan problems; the host scanner raises where this one prints
+// "SCAN ERROR: ..." and hands back an ERROR token. An EOF token (type 43)
+// is always appended last.
+//
+// Token type IDs:
+//   0  ERROR        1  FUNC         2  LET          3  TRUE
+//   4  FALSE        5  NULL         6  IDENTIFIER   7  INT
+//   8  STRING       9  LPAREN       10 RPAREN       11 COMMA
+//   12 SEMICOLON    13 PLUS         14 MINUS        15 STAR
+//   16 SLASH        17 PERCENT      18 CARET        19 BANG
+//   20 BANG_EQUAL   21 EQUAL_EQUAL  22 LESS         23 LESS_EQUAL
+//   24 GREATER      25 GREATER_EQUAL 26 AND_AND     27 OR_OR
+//   28 LBRACE       29 RBRACE       30 LBRACKET     31 RBRACKET
+//   32 QUESTION     33 COLON        34 EQUAL        35 IF
+//   36 ELSE         37 WHILE        38 FOR          39 PLUS_PLUS
+//   40 ARROW        41 COLON_EQUAL  42 RETURN       43 EOF
+//
+// Expected usage:
+//   bootstrap/scanner.srn is inlined into a driver program (like the stdlib
+//   modules are) and scan(<text>) is called from main.
+
+func scan(source) => (
+    let idx = 0;
+    let line = 1;
+    let col = 1;
+    let tokens = [];
+    while (idx < length(source)) => {
+        let step = scanStep(source, idx, line, col);
+        idx = at(step, 0);
+        line = at(step, 1);
+        col = at(step, 2);
+        if (at(step, 3) != null) => {
+            tokens = append(tokens, at(step, 3));
+        }
+    }
+    return append(tokens, [43, "", line, col]);
+)
+
+func scanStep(source, idx, line, col) => (
+    let adv = advance(source, idx, line, col);
+    let c = at(adv, 0);
+    let i = at(adv, 1);
+    let l = at(adv, 2);
+    let k = at(adv, 3);
+    if (c == " " || c == "\t" || c == "\r") => {
+        return [i, l, k, null];
+    } else => {
+        if (c == "\n") => {
+            return [i, l + 1, 1, null];
+        } else => {
+            if (c == "/" && peek(source, i) == "/") => {
+                let skip = skipComment(source, i, k);
+                return [at(skip, 0), l, at(skip, 1), null];
+            } else => {
+                if (c == "/" && peek(source, i) == "*") => {
+                    let skip = skipBlock(source, i, l, k);
+                    return [at(skip, 0), at(skip, 1), at(skip, 2), null];
+                } else => {
+                    if (c == "=" && peek(source, i) == ">") => {
+                        return [i + 1, l, k + 1, tok(40, "=>", line, col)];
+                    } else => {
+                        if (c == "+" && peek(source, i) == "+") => {
+                            return [i + 1, l, k + 1, tok(39, "++", line, col)];
+                        } else => {
+                            if (c == "=" && peek(source, i) == "=") => {
+                                return [i + 1, l, k + 1, tok(21, "==", line, col)];
+                            } else => {
+                                if (c == "!" && peek(source, i) == "=") => {
+                                    return [i + 1, l, k + 1, tok(20, "!=", line, col)];
+                                } else => {
+                                    if (c == "<" && peek(source, i) == "=") => {
+                                        return [i + 1, l, k + 1, tok(23, "<=", line, col)];
+                                    } else => {
+                                        if (c == ">" && peek(source, i) == "=") => {
+                                            return [i + 1, l, k + 1, tok(25, ">=", line, col)];
+                                        } else => {
+                                            if (c == "&" && peek(source, i) == "&") => {
+                                                return [i + 1, l, k + 1, tok(26, "&&", line, col)];
+                                            } else => {
+                                                if (c == "|" && peek(source, i) == "|") => {
+                                                    return [i + 1, l, k + 1, tok(27, "||", line, col)];
+                                                } else => {
+                                                    if (c == ":" && peek(source, i) == "=") => {
+                                                        return [i + 1, l, k + 1, tok(41, ":=", line, col)];
+                                                    } else => {
+                                                        if (c == "\"") => {
+                                                            return scanString(source, i, l, k, line, col);
+                                                        } else => {
+                                                            if (isDigit(c)) => {
+                                                                return scanNumber(source, i, l, k, c, line, col);
+                                                            } else => {
+                                                                if (isAlpha(c) || c == "_") => {
+                                                                    return scanIdent(source, i, l, k, c, line, col);
+                                                                } else => {
+                                                                    let t = singleTok(c, line, col);
+                                                                    if (t != null) => {
+                                                                        return [i, l, k, t];
+                                                                    } else => {
+                                                                        if (c == "!") => {
+                                                                            return [i, l, k, tok(19, c, line, col)];
+                                                                        } else => {
+                                                                            if (c == "<") => {
+                                                                                return [i, l, k, tok(22, c, line, col)];
+                                                                            } else => {
+                                                                                if (c == ">") => {
+                                                                                    return [i, l, k, tok(24, c, line, col)];
+                                                                                } else => {
+                                                                                    println("SCAN ERROR: unexpected character '" + c + "'");
+                                                                                    return [i, l, k, tok(0, c, line, col)];
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+)
+
+func scanNumber(source, idx, line, col, first, tokLine, tokCol) => (
+    let i = idx;
+    let value = first;
+    while (i < length(source) && isDigit(charAt(source, i))) => {
+        value = value + charAt(source, i);
+        i = i + 1;
+    }
+    return [i, line, col + i - idx, tok(7, value, tokLine, tokCol)];
+)
+
+func scanIdent(source, idx, line, col, first, tokLine, tokCol) => (
+    let i = idx;
+    let value = first;
+    while (i < length(source) && isIdentChar(charAt(source, i))) => {
+        value = value + charAt(source, i);
+        i = i + 1;
+    }
+    let id = keywordId(value);
+    return [i, line, col + i - idx, tok(id == 0 ? 6 : id, value, tokLine, tokCol)];
+)
+
+func scanString(source, idx, line, col, tokLine, tokCol) => (
+    let i = idx;
+    let l = line;
+    let k = col;
+    let value = "";
+    let done = 0;
+    let error = 0;
+    while (done == 0) => {
+        if (i >= length(source)) => {
+            error = 1;
+            done = 1;
+        } else => {
+            let ch = charAt(source, i);
+            if (ch == "\"") => {
+                i = i + 1;
+                k = k + 1;
+                done = 1;
+            } else => {
+                if (ch == "\\") => {
+                    if (i + 1 >= length(source)) => {
+                        i = i + 1;
+                        error = 1;
+                        done = 1;
+                    } else => {
+                        value = value + escapeOf(charAt(source, i + 1));
+                        i = i + 2;
+                        k = k + 2;
+                    }
+                } else => {
+                    value = value + ch;
+                    i = i + 1;
+                    if (ch == "\n") => {
+                        l = l + 1;
+                        k = 1;
+                    } else => {
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+    }
+    if (error == 1) => {
+        println("SCAN ERROR: unterminated string");
+        return [i, l, k, tok(0, value, tokLine, tokCol)];
+    } else => {
+        return [i, l, k, tok(8, value, tokLine, tokCol)];
+    }
+)
+
+func skipComment(source, idx, col) => (
+    let i = idx;
+    let k = col;
+    while (i < length(source) && peek(source, i) != "\n") => {
+        i = i + 1;
+        k = k + 1;
+    }
+    return [i, k];
+)
+
+func skipBlock(source, idx, line, col) => (
+    let i = idx;
+    let l = line;
+    let k = col;
+    let done = 0;
+    while (done == 0) => {
+        if (i >= length(source)) => {
+            done = 1;
+        } else => {
+            let c1 = charAt(source, i);
+            let c2 = i + 1 < length(source) ? charAt(source, i + 1) : "";
+            if (c1 == "*" && c2 == "/") => {
+                i = i + 2;
+                k = k + 2;
+                done = 1;
+            } else => {
+                if (c1 == "\n") => {
+                    i = i + 1;
+                    l = l + 1;
+                    k = 1;
+                } else => {
+                    i = i + 1;
+                    k = k + 1;
+                }
+            }
+        }
+    }
+    if (i >= length(source)) => {
+        println("SCAN ERROR: unterminated block comment");
+    }
+    return [i, l, k];
+)
+
+func advance(source, idx, line, col) => (
+    return [charAt(source, idx), idx + 1, line, col + 1];
+)
+
+func atEnd(source, idx) => (
+    return idx >= length(source);
+)
+
+func peek(source, idx) => (
+    return atEnd(source, idx) ? "" : charAt(source, idx);
+)
+
+func isDigit(c) => (
+    return c >= "0" && c <= "9";
+)
+
+func isAlpha(c) => (
+    return c >= "a" && c <= "z" || c >= "A" && c <= "Z";
+)
+
+func isIdentChar(c) => (
+    return isAlpha(c) || isDigit(c) || c == "_";
+)
+
+func tok(typeId, lexeme, line, col) => (
+    return [typeId, lexeme, line, col];
+)
+
+func singleTok(c, line, col) => (
+    if (c == "(") => { return tok(9, c, line, col); }
+    else => { if (c == ")") => { return tok(10, c, line, col); }
+    else => { if (c == ",") => { return tok(11, c, line, col); }
+    else => { if (c == ";") => { return tok(12, c, line, col); }
+    else => { if (c == "+") => { return tok(13, c, line, col); }
+    else => { if (c == "-") => { return tok(14, c, line, col); }
+    else => { if (c == "*") => { return tok(15, c, line, col); }
+    else => { if (c == "/") => { return tok(16, c, line, col); }
+    else => { if (c == "%") => { return tok(17, c, line, col); }
+    else => { if (c == "^") => { return tok(18, c, line, col); }
+    else => { if (c == "{") => { return tok(28, c, line, col); }
+    else => { if (c == "}") => { return tok(29, c, line, col); }
+    else => { if (c == "[") => { return tok(30, c, line, col); }
+    else => { if (c == "]") => { return tok(31, c, line, col); }
+    else => { if (c == "?") => { return tok(32, c, line, col); }
+    else => { if (c == ":") => { return tok(33, c, line, col); }
+    else => { if (c == "=") => { return tok(34, c, line, col); }
+    else => { return null; }
+    } } } } } } } } } } } } } } } }
+)
+
+func escapeOf(c) => (
+    if (c == "n") => { return "\n"; }
+    else => { if (c == "t") => { return "\t"; }
+    else => { if (c == "r") => { return "\r"; }
+    else => { if (c == "\"") => { return "\""; }
+    else => { if (c == "\\") => { return "\\"; }
+    else => { return c; }
+    } } } }
+)
+
+func keywordId(text) => (
+    if (text == "func") => { return 1; }
+    else => { if (text == "let") => { return 2; }
+    else => { if (text == "true") => { return 3; }
+    else => { if (text == "false") => { return 4; }
+    else => { if (text == "null") => { return 5; }
+    else => { if (text == "if") => { return 35; }
+    else => { if (text == "else") => { return 36; }
+    else => { if (text == "while") => { return 37; }
+    else => { if (text == "for") => { return 38; }
+    else => { if (text == "return") => { return 42; }
+    else => { return 0; }
+    } } } } } } } } }
+)
